@@ -251,7 +251,9 @@ def pack(packages,output,level=3,large_raw=True,verify=True,notify=lambda *a:Non
         if temp.exists():temp.unlink()
 
 class Slice(io.RawIOBase):
-    def __init__(self,path,offset,size):self.f=Path(path).open('rb');self.f.seek(offset);self.left=size
+    def __init__(self,path,offset,size,handle=None):
+        self.owns_handle=handle is None;self.f=Path(path).open('rb') if handle is None else handle
+        self.f.seek(offset);self.left=size
     def readable(self):return True
     def readinto(self,b):
         with memoryview(b).cast('B') as view:
@@ -260,7 +262,9 @@ class Slice(io.RawIOBase):
         self.left-=count;return count
     def read(self,n=-1):
         data=self.f.read(self.left if n<0 else min(n,self.left));self.left-=len(data);return data
-    def close(self):self.f.close();super().close()
+    def close(self):
+        if self.owns_handle:self.f.close()
+        super().close()
 
 class Archive:
     def __init__(self,path,cancel=None):
@@ -312,7 +316,7 @@ class Archive:
             no,nl,first,count,r=DIR.unpack_from(toc,at);at+=DIR.size
             require(not r and first<=slots and count<=slots-first,'Invalid directory child range.')
             self.dirs.append((name(no,nl,i in roots),first,count))
-        extent_ids={};checked_frames=set()
+        extent_ids={};checked_frames=set();self.max_frame_window=0
         for i in range(nf):
             no,nl,size,off,stored,digest,codec,cf,r,r3=FILE.unpack_from(toc,at);at+=FILE.size
             require(codec in (0,1) and not cf and not r and not any(r3),'Unknown codec or file flags.')
@@ -327,6 +331,7 @@ class Archive:
                     checked_frames.add(key)
                     head=self.read_at(off,min(stored,18));params=zstd.get_frame_parameters(head)
                     require(params.content_size==size and params.dict_id==0,'Zstandard frame size/dictionary is unsupported.')
+                    self.max_frame_window=max(self.max_frame_window,params.window_size)
                     require(params.window_size<=MAX_ZSTD_WINDOW,'Zstandard frame requires a decoder window larger than 1 GiB.')
                     cursor=off+zstd.frame_header_size(head)
                     while True:
@@ -393,7 +398,9 @@ class Archive:
             key=file[1:]
             if key in unique:unique[key][1]+=file[1]
             else:unique[key]=[i,file[1]]
-        workers=min(4,os.cpu_count() or 1) if workers is None else max(1,workers)
+        workers=min(4,os.cpu_count() or 1) if workers is None else max(1,min(16,workers))
+        if self.max_frame_window:
+            workers=min(workers,max(1,(256*1024*1024)//self.max_frame_window))
         ordered=sorted(unique.values(),key=lambda item:self.files[item[0]][2])
         # Keep tiny files and small archives on the low-overhead sequential path.
         if workers>1 and len(ordered)>1 and total>=8*BLOCK and sum(self.files[i][1]>=BLOCK for i,_ in ordered)>1:
@@ -402,22 +409,23 @@ class Archive:
                 if not hasattr(local,'buffer'):
                     local.buffer=bytearray(BLOCK)
                     local.decoder=zstd.ZstdDecompressor(max_window_size=MAX_ZSTD_WINDOW)
-                for i,logical_size in group:
-                    check(self.cancel)
-                    name,size,off,stored,expected,codec=self.files[i]
-                    h=hashlib.sha256();count=0
-                    with Slice(self.path,off,stored) as raw:
-                        with (local.decoder.stream_reader(raw,read_across_frames=False,closefd=False) if codec else raw) as reader:
-                            with memoryview(local.buffer) as view:
-                                while True:
-                                    check(self.cancel)
-                                    with view[:min(BLOCK,size-count+1)] as target:
-                                        length=reader.readinto(target)
-                                        if not length:break
-                                        require(length<=size-count,'Decompressed file exceeds its declared size.')
-                                        with target[:length] as chunk:h.update(chunk)
-                                    count+=length
-                    require(count==size and h.digest()==expected,'File SHA-256 mismatch: '+name)
+                with self.path.open('rb') as handle:
+                    for i,logical_size in group:
+                        check(self.cancel)
+                        name,size,off,stored,expected,codec=self.files[i]
+                        h=hashlib.sha256();count=0
+                        with Slice(self.path,off,stored,handle=handle) as raw:
+                            with (local.decoder.stream_reader(raw,read_across_frames=False,closefd=False) if codec else raw) as reader:
+                                with memoryview(local.buffer) as view:
+                                    while True:
+                                        check(self.cancel)
+                                        with view[:min(BLOCK,size-count+1)] as target:
+                                            length=reader.readinto(target)
+                                            if not length:break
+                                            require(length<=size-count,'Decompressed file exceeds its declared size.')
+                                            with target[:length] as chunk:h.update(chunk)
+                                        count+=length
+                        require(count==size and h.digest()==expected,'File SHA-256 mismatch: '+name)
                 return sum(logical_size for _,logical_size in group)
             def groups():
                 group=[];size=0
@@ -466,7 +474,7 @@ class Archive:
                             with target[:n] as chunk:h.update(chunk)
                         count+=n;done+=n;report()
                 else:
-                    with Slice(self.path,off,stored) as raw:
+                    with Slice(self.path,off,stored,handle=self.f) as raw:
                         with decoder.stream_reader(raw,read_across_frames=False,closefd=False) as reader:
                             while True:
                                 check(self.cancel)

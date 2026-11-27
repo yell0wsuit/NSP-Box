@@ -1,6 +1,7 @@
 """General-purpose portable app engine for complete extracted title snapshots."""
 from dataclasses import dataclass
 from pathlib import Path
+from contextlib import closing
 from PIL import Image, ImageOps
 import hashlib, io, json, mmap, os, re, shutil, stat, struct, tempfile, time, uuid
 import container_format as fmt
@@ -127,48 +128,46 @@ def verify_image(path,snapshot,inventory,notify,cancel,source_hashes=None):
             return _verify_region(verifier.Region(mm),snapshot,inventory,notify,source_hashes)
 
 def _verify_region(buf,snapshot,inventory,notify,source_hashes=None):
-    assert bytes(buf[:4])==b'PFS0','NSP/PFS0 header'
+    verifier.require(bytes(buf[:4])==b'PFS0','NSP/PFS0 header')
     ncas=verifier.partition(buf);distribution=0
     parsed={};nca_hashes={}
     for name,data in ncas.items():
         fmt.checkpoint()
-        assert data[0x204]==distribution,'NCA distribution type'
+        verifier.require(data[0x204]==distribution,'NCA distribution type')
         nca_hashes[name]=verifier.digest(data)
-        assert nca_hashes[name][:16].hex()==name[:32],'NCA content hash'
+        verifier.require(nca_hashes[name][:16].hex()==name[:32],'NCA content hash')
         parsed[name]=verifier.nca_sections(data)
     program=next(v for v in parsed.values() if v[1]==0)
-    assert program[0]==snapshot.title_id,'Program ID mismatch'
+    verifier.require(program[0]==snapshot.title_id,'Program ID mismatch')
     exefs=verifier.partition(next(b for kind,b in program[2] if kind=='pfs'))
     romfs=verifier.romfs_files(next(b for kind,b in program[2] if kind=='romfs'))
-    checked=[];total=sum(v[0] for v in inventory.values());done=0
+    checked=[];total=sum(v[0] for v in inventory.values());done=0;last=0.0
     for folder,packed in [('exefs',exefs),('romfs',romfs)]:
         originals={p.relative_to(snapshot.root/folder).as_posix():p for p in inventory if snapshot.root/folder in p.parents}
-        assert set(originals)==set(packed),'Packed file list differs from source'
-        for name,p in originals.items():
-            fmt.checkpoint()
-            if source_hashes is None:
-                h=hashlib.sha256()
-                with p.open('rb') as source:
-                    while b:=source.read(4*1024*1024):
-                        fmt.checkpoint();h.update(b)
-                expected=h.digest()
-            else:
-                expected=source_hashes.get(p)
-                assert expected is not None,f'Source hash was not captured: {folder}/{name}'
-            assert expected==verifier.digest(packed[name]),f'Packed file differs: {folder}/{name}'
-            done+=inventory[p][0];notify('Comparing source files',82+17*done/max(total,1))
-            checked.append({'path':folder+'/'+name,'size':inventory[p][0],'sha256':expected.hex()})
+        verifier.require(set(originals)==set(packed),'Packed file list differs from source')
+        def expected_for(p):
+            return verifier.file_digest(p) if source_hashes is None else source_hashes.get(p)
+        def progress(size):
+            nonlocal done,last
+            done+=size;now=time.monotonic()
+            if now-last>=0.1:
+                notify('Comparing source files',82+17*done/max(total,1));last=now
+        with closing(verifier.compare_files(originals,packed,expected_for,progress)) as results:
+            for name,expected in results:
+                p=originals[name]
+                checked.append({'path':folder+'/'+name,'size':inventory[p][0],'sha256':expected.hex()})
+    notify('Comparing source files',99)
     meta=next(v for v in parsed.values() if v[1]==1)
     cnmt=next(iter(verifier.partition(meta[2][0][1]).values()))
     tid,ver,ctype,_,extra,count=verifier.u('QIBBHH',cnmt)
-    assert tid==snapshot.title_id and ver==snapshot.version and ctype==0x80,'CNMT title or version'
-    assert verifier.digest(cnmt[:-32])==bytes(cnmt[-32:]),'CNMT digest'
+    verifier.require(tid==snapshot.title_id and ver==snapshot.version and ctype==0x80,'CNMT title or version')
+    verifier.require(verifier.digest(cnmt[:-32])==bytes(cnmt[-32:]),'CNMT digest')
     for i in range(count):
         at=0x20+extra+i*0x38;digest=bytes(cnmt[at:at+32]);nid=bytes(cnmt[at+32:at+48]).hex()
         size=int.from_bytes(cnmt[at+48:at+54],'little');data=ncas[nid+'.nca']
-        assert len(data)==size and nca_hashes[nid+'.nca']==digest,'CNMT content record'
+        verifier.require(len(data)==size and nca_hashes[nid+'.nca']==digest,'CNMT content record')
     control=next(v for v in parsed.values() if v[1]==2)
-    cfiles=verifier.romfs_files(control[2][0][1]);assert 'control.nacp' in cfiles
+    cfiles=verifier.romfs_files(control[2][0][1]);verifier.require('control.nacp' in cfiles)
     return checked
 
 def build(snapshot,output,title,display_version,artwork_path=None,verify=True,notify=lambda *a:None,cancel=None,output_format=None,package_folder=False):

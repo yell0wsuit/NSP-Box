@@ -272,32 +272,7 @@ def nsp_to_nup(path,output,include_kinds=None,**options):
         return pack(select_packages(packages,include_kinds),output,**options)
 
 def romfs_files(buf):
-    """Bounded RomFS traversal: never follow repeated offsets in imported NSPs."""
-    vals=vf.u('10Q',buf);require(vals[0]==0x50,'Invalid RomFS header.')
-    dt,ds,ft,fs,data=vals[3],vals[4],vals[7],vals[8],vals[9]
-    require(0x50<=dt<=len(buf) and ds<=len(buf)-dt and ft<=len(buf) and fs<=len(buf)-ft and data<=len(buf),'Invalid RomFS table bounds.')
-    result={};seen_dirs=set();seen_files=set()
-    def visit(off,prefix,depth=0):
-        require(depth<256,'RomFS directory nesting is too deep.')
-        while off!=0xffffffff:
-            check_cancel=vf.checkpoint;check_cancel()
-            require(off not in seen_dirs and off+24<=ds,'Cyclic or invalid RomFS directory.');seen_dirs.add(off)
-            par,sibling,child,first,hl,n=vf.u('6I',buf,dt+off)
-            require(n<=ds-off-24,'RomFS directory name out of bounds.')
-            name=bytes(buf[dt+off+24:dt+off+24+n]).decode('utf-8')
-            if name:safe_name(name)
-            current=prefix+'/'+name if prefix and name else prefix or name
-            entry=first
-            while entry!=0xffffffff:
-                check_cancel();require(entry not in seen_files and entry+32<=fs,'Cyclic or invalid RomFS file.');seen_files.add(entry)
-                fp,nextfile,fo,size,fh,fn=vf.u('IIQQII',buf,ft+entry)
-                require(fn<=fs-entry-32 and fo<=len(buf)-data and size<=len(buf)-data-fo,'RomFS file out of bounds.')
-                name=bytes(buf[ft+entry+32:ft+entry+32+fn]).decode('utf-8');safe_name(name)
-                path=current+'/'+name if current else name;require(path not in result,'Duplicate RomFS file.')
-                result[path]=buf[data+fo:data+fo+size];entry=nextfile
-            if child!=0xffffffff:visit(child,current,depth+1)
-            off=sibling
-    visit(0,'');return result
+    return vf.romfs_files(buf,validate_name=safe_name)
 
 def merge_game(packages,selection=None):
     """Eglantine semantics: highest update, whole update ExeFS, RomFS shadowing.

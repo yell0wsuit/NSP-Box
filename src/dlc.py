@@ -1,6 +1,7 @@
 """Data-only extracted DLC repacks. No game executable, rights or keys are created."""
 from dataclasses import dataclass
 from pathlib import Path
+from contextlib import closing
 import hashlib, mmap, os, re, shutil, stat, struct, time, uuid
 import container_format as fmt
 import verify_format as reader
@@ -162,43 +163,48 @@ def verify(path, snapshot, sources, notify=lambda *a: None, captured=None):
     reader.checkpoint = fmt.checkpoint
     with Path(path).open('rb') as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
         files, distribution = container_files(reader.Region(mm))
-        assert len(files) == 2, 'Expected exactly Data and Meta NCAs'
+        reader.require(len(files) == 2, 'Expected exactly Data and Meta NCAs')
         parsed = {}
         hashes = {}
         for name, data in files.items():
             fmt.checkpoint()
-            assert data[0x204] == distribution, 'NCA distribution type'
+            reader.require(data[0x204] == distribution, 'NCA distribution type')
             hashes[name] = reader.digest(data)
-            assert hashes[name][:16].hex() == name[:32], 'NCA content ID'
+            reader.require(hashes[name][:16].hex() == name[:32], 'NCA content ID')
             tid, kind, sections = reader.nca_sections(data)
-            assert tid == snapshot.title_id, 'DLC title ID'
-            assert kind not in parsed, 'Duplicate content type'
+            reader.require(tid == snapshot.title_id, 'DLC title ID')
+            reader.require(kind not in parsed, 'Duplicate content type')
             parsed[kind] = sections
-        assert set(parsed) == {1, 4}, 'DLC must contain Meta and Data, no game executable'
+        reader.require(set(parsed) == {1, 4}, 'DLC must contain Meta and Data, no game executable')
         cfiles = reader.partition(parsed[1][0][1])
-        assert list(cfiles) == [f'AddOnContent_{snapshot.title_id:016x}.cnmt'], 'CNMT filename'
+        reader.require(list(cfiles) == [f'AddOnContent_{snapshot.title_id:016x}.cnmt'], 'CNMT filename')
         c = next(iter(cfiles.values()))
         tid, version, kind, platform, extra, count, metas = reader.u('QIBBHHH', c)
-        assert (tid, version, kind, extra, count, metas) == (snapshot.title_id, snapshot.version, 0x82, 0x18, 1, 0), 'CNMT identity/type'
-        assert reader.u('Q', c, 0x20)[0] == snapshot.base_id, 'CNMT application mapping'
-        assert len(c) == 0x20 + extra + 0x38 + 32, 'CNMT size'
-        assert reader.digest(c[:-32]) == bytes(c[-32:]), 'CNMT digest'
+        reader.require((tid, version, kind, extra, count, metas) == (snapshot.title_id, snapshot.version, 0x82, 0x18, 1, 0), 'CNMT identity/type')
+        reader.require(reader.u('Q', c, 0x20)[0] == snapshot.base_id, 'CNMT application mapping')
+        reader.require(len(c) == 0x20 + extra + 0x38 + 32, 'CNMT size')
+        reader.require(reader.digest(c[:-32]) == bytes(c[-32:]), 'CNMT digest')
         at = 0x20 + extra
         name = bytes(c[at+32:at+48]).hex() + '.nca'
-        assert name in files and hashes[name] == bytes(c[at:at+32]), 'CNMT Data hash'
-        assert int.from_bytes(bytes(c[at+48:at+54]), 'little') == len(files[name]), 'CNMT Data size'
-        assert (c[at+54], c[at+55]) == (2, 0), 'CNMT Data record type/index'
+        reader.require(name in files and hashes[name] == bytes(c[at:at+32]), 'CNMT Data hash')
+        reader.require(int.from_bytes(bytes(c[at+48:at+54]), 'little') == len(files[name]), 'CNMT Data size')
+        reader.require((c[at+54], c[at+55]) == (2, 0), 'CNMT Data record type/index')
         packed = reader.romfs_files(next(b for k, b in parsed[4] if k == 'romfs'))
         original = {p.relative_to(snapshot.root/'romfs').as_posix(): p for p in sources}
-        assert set(original) == set(packed), 'DLC RomFS file list'
+        reader.require(set(original) == set(packed), 'DLC RomFS file list')
         total = sum(st[0] for st in sources.values())
         done = 0
-        for name, p in original.items():
-            fmt.checkpoint()
-            expected = captured[p] if captured is not None else reader.file_digest(p)
-            assert expected is not None and reader.digest(packed[name]) == expected, 'DLC file hash: ' + name
-            done += sources[p][0]
-            notify('Comparing DLC source files', 82 + 17 * done / max(1, total))
+        last=0.0
+        def expected_for(p):
+            return reader.file_digest(p) if captured is None else captured.get(p)
+        def progress(size):
+            nonlocal done,last
+            done+=size;now=time.monotonic()
+            if now-last>=0.1:
+                notify('Comparing DLC source files',82+17*done/max(1,total));last=now
+        with closing(reader.compare_files(original,packed,expected_for,progress)) as results:
+            for _ in results:pass
+        notify('Comparing DLC source files',99)
     return len(sources)
 
 

@@ -48,6 +48,18 @@ class VerificationSafetyTests(unittest.TestCase):
             for padded in (False,True):
                 self.assertEqual(list(verifier.block_digests(region,4096,padded,workers=1)),
                                  list(verifier.block_digests(region,4096,padded,workers=4)))
+    def test_parallel_file_comparison_and_corruption(self):
+        path=self.root/'mapped.bin';data=b'a'*(5*1024*1024)+b'b'*(5*1024*1024)
+        path.write_bytes(data)
+        import hashlib
+        from contextlib import closing
+        expected={'a':hashlib.sha256(data[:len(data)//2]).digest(),'b':hashlib.sha256(data[len(data)//2:]).digest()}
+        with path.open('rb') as f,mmap.mmap(f.fileno(),0,access=mmap.ACCESS_READ) as mm:
+            region=verifier.Region(mm);packed={'a':region[:len(data)//2],'b':region[len(data)//2:]}
+            for workers in (1,4):
+                self.assertEqual(dict(verifier.compare_files(dict(a='a',b='b'),packed,expected.get,workers=workers)),expected)
+            with closing(verifier.compare_files(dict(a='a',b='b'),packed,lambda _:bytes(32),workers=4)) as results:
+                with self.assertRaises(AssertionError):list(results)
     def test_failed_block_hash_releases_mmap(self):
         fmt.configure();header,section=fmt.romfs_section(fmt.Blob(b'a'*50000))
         blob=fmt.nca([(header,section)],self.snapshot.title_id,0)
