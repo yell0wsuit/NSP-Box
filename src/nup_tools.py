@@ -328,13 +328,21 @@ def compact_packages(packages):
     merged=merge_game(packages)
     return [merged]+[p for p in packages if p.kind not in (0,1)]
 
-def build_snapshot_nsp(package,output,verify=True,notify=lambda *a:None,cancel=None):
+def build_snapshot_nsp(package,output,verify=True,notify=lambda *a:None,cancel=None,contiguous=True):
     """Rebuild a snapshot, honoring explicit presentation metadata overrides."""
     output=Path(output);require(not output.exists(),'NSP output already exists.')
-    fmt.configure(cancel,lambda done,total:notify('Building NSP integrity trees',20+35*done/max(total,1)))
+    phase=[20,45,'Building NSP integrity trees'];last_progress=20
+    def report(done,total):
+        nonlocal last_progress
+        last_progress=max(last_progress,phase[0]+(phase[1]-phase[0])*done/max(total,1))
+        notify(phase[2],last_progress)
+    fmt.configure(cancel,report)
     with tempfile.TemporaryDirectory(prefix='.nup-nsp-',dir=output.parent) as work:
         root=Path(work);total=sum(s.size for s in package.files.values());done=0;expected_hashes={};last=0.0
+        indexed=contiguous and package.kind!=2
+        rom_sources={name[6:]:source for name,source in package.files.items() if name.startswith('romfs/')} if indexed else {}
         for name,source in package.files.items():
+            if indexed and name.startswith('romfs/'):continue
             if not name.startswith(('exefs/','romfs/','data/control/','control/')) and name!='control.nacp':continue
             target=root.joinpath(*path_parts(name));target.parent.mkdir(parents=True,exist_ok=True)
             with source.opener() as f,target.open('xb') as out:
@@ -380,11 +388,48 @@ def build_snapshot_nsp(package,output,verify=True,notify=lambda *a:None,cancel=N
             expected_files['data/control/icon_AmericanEnglish.dat']=Source.data(icon)
             expected_hashes['data/control/icon_AmericanEnglish.dat']=hashlib.sha256(icon).digest()
         exefs=root/'exefs';romfs=root/'romfs'
-        require(exefs.is_dir() and romfs.is_dir(),'Missing complete ExeFS/RomFS snapshot.')
+        require(exefs.is_dir() and (bool(rom_sources) if indexed else romfs.is_dir()),'Missing complete ExeFS/RomFS snapshot.')
         require(all(p.is_file() for p in exefs.iterdir()),'Nested ExeFS directories are unsupported by NSP.')
-        program=fmt.nca([fmt.pfs_section(fmt.filesystem([(p.name,p) for p in sorted(exefs.iterdir())])),fmt.romfs_section(fmt.romfs(romfs,[]))],package.title_id,0,0)
+        if indexed:
+            from contextlib import ExitStack
+            import zstandard as zstd
+            from nup_format import MAX_ZSTD_WINDOW
+            notify('Indexing RomFS files',20)
+            with ExitStack() as stack:
+                handles={};decoder=zstd.ZstdDecompressor(max_window_size=MAX_ZSTD_WINDOW)
+                hashes_by_source={}
+                def write_source(source,out):
+                    nonlocal done,last
+                    check(cancel);count=0
+                    if source.archive_entry is not None:
+                        archive,index=source.archive_entry
+                        if archive not in handles:
+                            archive.unchanged();handles[archive]=stack.enter_context(archive.path.open('rb'))
+                        for chunk in archive.file_chunks(index,handles[archive],decoder):
+                            out.write(chunk);count+=len(chunk)
+                        digest=archive.files[index][4]
+                    else:
+                        source.validate();h=hashlib.sha256()
+                        with source.opener() as stream:
+                            while chunk:=stream.read(1024*1024):
+                                check(cancel);count+=len(chunk)
+                                require(count<=source.size,'Source size changed.')
+                                out.write(chunk);h.update(chunk)
+                        source.validate();digest=h.digest()
+                    require(count==source.size,'Incomplete snapshot file.')
+                    if verify:hashes_by_source[id(source)]=digest
+                    done+=count;now=time.monotonic()
+                    if now-last>=0.1:notify('Staging contiguous RomFS',20+10*done/max(total,1));last=now
+                rblob=fmt.romfs_indexed(rom_sources,root/'romfs.payload',write_source)
+                for archive in handles:archive.unchanged()
+                if verify:expected_hashes.update(('romfs/'+name,hashes_by_source[id(source)]) for name,source in rom_sources.items())
+            phase[:]=[30,50,'Building NSP integrity trees'];last_progress=30
+        else:
+            rblob=fmt.romfs(romfs,[])
+        program=fmt.nca([fmt.pfs_section(fmt.filesystem([(p.name,p) for p in sorted(exefs.iterdir())])),fmt.romfs_section(rblob)],package.title_id,0,0)
         control_nca=fmt.nca([fmt.romfs_section(fmt.romfs(control,[]))],package.title_id,2,0)
         records=[];entries=[]
+        phase[:]=[50,60,'Hashing NSP content'];last_progress=50
         for blob,ctype in ((program,1),(control_nca,3)):
             digest=blob.digest();entries.append((digest[:16].hex()+'.nca',blob));records.append(digest+digest[:16]+blob.size.to_bytes(6,'little')+bytes([ctype,0]))
         cnmt=bytearray(0x20);struct.pack_into('<QIBBHHH',cnmt,0,package.title_id,package.version,0x80,0,16,len(records),0)
@@ -402,6 +447,7 @@ def build_snapshot_nsp(package,output,verify=True,notify=lambda *a:None,cancel=N
                 notify('Writing reconstructed NSP',85)
                 out.flush();os.fsync(out.fileno())
             if verify:
+                notify('Verifying reconstructed NSP',86)
                 with nsp_packages(temp,cancel) as rebuilt:
                     actual=rebuilt[0]
                     for name,source in expected_files.items():
@@ -418,7 +464,7 @@ def build_snapshot_nsp(package,output,verify=True,notify=lambda *a:None,cancel=N
         finally:
             if temp.exists():temp.unlink()
 
-def nup_to_nsp(path,output,selection=None,verify=True,notify=lambda *a:None,cancel=None,include_kinds=None):
+def nup_to_nsp(path,output,selection=None,verify=True,notify=lambda *a:None,cancel=None,include_kinds=None,contiguous=True):
     """Whole archive -> game+highest update and separate DLC NSPs, or one package."""
     output=Path(output).absolute();require(not output.exists(),'Output already exists; choose a new path.')
     output.parent.mkdir(parents=True,exist_ok=True)
@@ -441,13 +487,13 @@ def nup_to_nsp(path,output,selection=None,verify=True,notify=lambda *a:None,canc
         require(len(packages)==1 or output.suffix.lower()!='.nsp','A game plus DLC needs a new output folder, not one .nsp filename.')
         single=output.suffix.lower()=='.nsp'
         if single:
-            result=build_snapshot_nsp(packages[0],output,verify,notify,cancel);archive.unchanged();notify('NSP ready',100);return result
+            result=build_snapshot_nsp(packages[0],output,verify,lambda s,v:notify(s,10+89*v/100),cancel,contiguous);archive.unchanged();notify('NSP ready',100);return result
         stage=Path(tempfile.mkdtemp(prefix='.nup-convert-',dir=output.parent))
         try:
             results=[]
             for i,p in enumerate(packages):
                 check(cancel);name=f'{"DLC" if p.kind==2 else "Game"} [{p.title_id:016X}] v{p.version}.nsp'
-                result=build_snapshot_nsp(p,stage/name,verify,lambda s,v:notify(s,10+89*(i+v/100)/len(packages)),cancel);results.append(result)
+                result=build_snapshot_nsp(p,stage/name,verify,lambda s,v:notify(s,10+89*(i+v/100)/len(packages)),cancel,contiguous);results.append(result)
             archive.unchanged();check(cancel);stage.rename(output);notify('NSP conversion complete',100)
             return {'output':str(output),'size':sum(r['size'] for r in results),'verified':verify,'packages':len(results)}
         finally:

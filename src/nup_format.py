@@ -58,6 +58,7 @@ class Source:
     opener:object
     stamp:object=None
     validator:object=None
+    archive_entry:object=None
 
     @classmethod
     def path(cls,path,st=None):
@@ -426,7 +427,7 @@ class Archive:
             for index,label in ((ex,'exefs'),(rom,'romfs')):
                 if index!=NONE:require(directory_paths.get(index)==label,'Package content directory does not match its tree.')
             p.directories=directories
-            p.files={path:Source(self.files[index][1],lambda i=index:self.open_file(i),validator=self.unchanged) for path,index in paths.items()}
+            p.files={path:Source(self.files[index][1],lambda i=index:self.open_file(i),validator=self.unchanged,archive_entry=(self,index)) for path,index in paths.items()}
             self.trees.append(paths)
         require(len(used)==nd+nf and len(used_slots)==slots,'Unreferenced NUP nodes or child slots.')
         self.stats={'packages':pc,'files':nf,'uncompressed':sum(f[1] for f in self.files),'stored':sum(k[1]-k[0] for k in extent_ids),'archive_size':fs,

@@ -126,6 +126,25 @@ def name_hash(parent, name):
     return h
 
 def romfs(root, manifest, notify=None):
+    return _romfs(root,manifest,notify)
+
+
+def romfs_indexed(files, staging, write_source, notify=None):
+    """Build the same RomFS tables from an index, writing one aligned payload."""
+    tree={}
+    for name,source in files.items():
+        checkpoint();parts=name.split('/')
+        if any(p in ('','.','..') or '\\' in p or '\0' in p for p in parts):raise ValueError('Invalid indexed RomFS path')
+        branch=tree
+        for part in parts[:-1]:
+            branch=branch.setdefault(part,{})
+            if not isinstance(branch,dict):raise ValueError('RomFS path collision')
+        if parts[-1] in branch:raise ValueError('RomFS path collision')
+        branch[parts[-1]]=source
+    return _romfs(None,None,notify,tree,staging,write_source)
+
+
+def _romfs(root, manifest, notify=None, indexed=None, staging=None, write_source=None):
     dirs = []; files = []
     def visit(path, parent):
         checkpoint()
@@ -143,7 +162,19 @@ def romfs(root, manifest, notify=None):
                 files.append(f); d['files'].append(f)
                 if notify and len(files)%1024==0:notify(len(files))
         return d
-    visit(root,None)
+    def visit_index(branch,parent,name=''):
+        checkpoint()
+        d=dict(name=name.encode(),parent=parent,dirs=[],files=[]);dirs.append(d)
+        for name,source in sorted(branch.items(),key=lambda entry:entry[0].encode()):
+            checkpoint()
+            if isinstance(source,dict):d['dirs'].append(visit_index(source,d,name))
+            else:
+                f=dict(name=name.encode(),parent=d,size=source.size,source=source)
+                files.append(f);d['files'].append(f)
+                if notify and len(files)%1024==0:notify(len(files))
+        return d
+    if indexed is None:visit(root,None)
+    else:visit_index(indexed,None)
     doff = 0; foff = 0; dataoff = 0
     for d in dirs:
         d['off'] = doff; doff += 0x18+align(len(d['name']),4)
@@ -168,14 +199,23 @@ def romfs(root, manifest, notify=None):
         dt[pos+0x18:pos+0x18+len(d['name'])]=d['name']
     payload=[]; pos=0
     for f in files:
-        if len(manifest)%1024==0:checkpoint()
+        if manifest is None or len(manifest)%1024==0:checkpoint()
         sib=f['sibling']
         par=f['parent']['off']; bucket=name_hash(par,f['name'])%len(fh)
         entry=pack('IIQQII',par,sib,f['dataoff'],f['size'],fh[bucket],len(f['name']))
         fh[bucket]=f['off']; off=f['off'];ft[off:off+0x20]=entry
         ft[off+0x20:off+0x20+len(f['name'])]=f['name']
-        payload.extend([f['dataoff']-pos,FilePart(f['path'],f['size'])]);pos=f['dataoff']+f['size']
-        manifest.append({'path':str(f['path']), 'size':f['size'], 'romfs_offset':f['dataoff']})
+        if indexed is None:
+            payload.extend([f['dataoff']-pos,FilePart(f['path'],f['size'])]);pos=f['dataoff']+f['size']
+            manifest.append({'path':str(f['path']), 'size':f['size'], 'romfs_offset':f['dataoff']})
+    if indexed is not None:
+        with staging.open('xb',buffering=4*1024*1024) as out:
+            for f in files:
+                checkpoint();out.write(bytes(f['dataoff']-pos))
+                write_source(f['source'],out)
+                pos=f['dataoff']+f['size']
+                if out.tell()!=pos:raise IOError('Indexed RomFS source length mismatch')
+        payload=[FilePart(staging,pos)]
     dhb=pack('I'*len(dh),*dh);fhb=pack('I'*len(fh),*fh)
     dhpos=0x50;dtpos=dhpos+len(dhb);fhpos=dtpos+len(dt);ftpos=fhpos+len(fhb)
     datap=align(ftpos+len(ft),0x10)
