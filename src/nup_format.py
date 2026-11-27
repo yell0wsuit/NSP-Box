@@ -252,7 +252,10 @@ class Slice(io.RawIOBase):
     def __init__(self,path,offset,size):self.f=Path(path).open('rb');self.f.seek(offset);self.left=size
     def readable(self):return True
     def readinto(self,b):
-        data=self.f.read(min(len(b),self.left));b[:len(data)]=data;self.left-=len(data);return len(data)
+        with memoryview(b).cast('B') as view:
+            with view[:min(len(view),self.left)] as target:
+                count=self.f.readinto(target)
+        self.left-=count;return count
     def read(self,n=-1):
         data=self.f.read(self.left if n<0 else min(n,self.left));self.left-=len(data);return data
     def close(self):self.f.close();super().close()
@@ -307,7 +310,7 @@ class Archive:
             no,nl,first,count,r=DIR.unpack_from(toc,at);at+=DIR.size
             require(not r and first<=slots and count<=slots-first,'Invalid directory child range.')
             self.dirs.append((name(no,nl,i in roots),first,count))
-        extent_ids={}
+        extent_ids={};checked_frames=set()
         for i in range(nf):
             no,nl,size,off,stored,digest,codec,cf,r,r3=FILE.unpack_from(toc,at);at+=FILE.size
             require(codec in (0,1) and not cf and not r and not any(r3),'Unknown codec or file flags.')
@@ -318,7 +321,8 @@ class Archive:
                 key=(off,off+stored);properties=(size,digest,codec)
                 require(key not in extent_ids or extent_ids[key]==properties,'Conflicting shared extent.')
                 if key not in extent_ids:regions.append((*key,('file',i)));extent_ids[key]=properties
-                if codec==1:
+                if codec==1 and key not in checked_frames:
+                    checked_frames.add(key)
                     head=self.read_at(off,min(stored,18));params=zstd.get_frame_parameters(head)
                     require(params.content_size==size and params.dict_id==0,'Zstandard frame size/dictionary is unsupported.')
                     require(params.window_size<=MAX_ZSTD_WINDOW,'Zstandard frame requires a decoder window larger than 1 GiB.')
