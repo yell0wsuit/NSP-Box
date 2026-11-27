@@ -207,6 +207,24 @@ def verify(path, snapshot, sources, notify=lambda *a: None, captured=None):
     return len(sources)
 
 
+def build_image(romfs, title_id, version, hashing=lambda:None):
+    title_id=parse_id(title_id);version=parse_version(version)
+    data = fmt.nca([fmt.romfs_section(romfs)], title_id, 4, 0)
+    hashing()
+    digest = data.digest()
+    name = digest[:16].hex()+'.nca'
+    c = bytearray(0x20)
+    struct.pack_into('<QIBBHHH', c, 0, title_id, version, 0x82, 0, 0x18, 1, 0)
+    # Minimal AddOnContent extended header: original application ID, unknown
+    # required application version/accessibilities/data-patch ID left at zero.
+    c += struct.pack('<QIB3xQ', (title_id & BASE_MASK), 0, 0, 0)
+    c += digest + digest[:16] + data.size.to_bytes(6, 'little') + bytes([2, 0])
+    c += fmt.sha(c)
+    meta = fmt.nca([fmt.pfs_section(fmt.filesystem([(f'AddOnContent_{title_id:016x}.cnmt', c)]))],
+                   title_id, 1, 0)
+    return fmt.package([(name, data), (meta.digest()[:16].hex()+'.cnmt.nca', meta)], 'nsp')
+
+
 def build(snapshot, output, output_format=None, verify_output=True, base_game=None,
           notify=lambda *a: None, cancel=None):
     started = time.perf_counter()
@@ -231,20 +249,7 @@ def build(snapshot, output, output_format=None, verify_output=True, base_game=No
     phase = [2, 24, 'Building DLC integrity tree']
     fmt.configure(cancel, lambda done, total: notify(phase[2], phase[0]+(phase[1]-phase[0])*done/max(1,total)))
     romfs = fmt.romfs(snapshot.root/'romfs', [], lambda n: notify(f'Building DLC RomFS · {n:,} files', 2))
-    data = fmt.nca([fmt.romfs_section(romfs)], snapshot.title_id, 4, 0)
-    phase[:] = [24, 44, 'Hashing DLC content']
-    digest = data.digest()
-    name = digest[:16].hex()+'.nca'
-    c = bytearray(0x20)
-    struct.pack_into('<QIBBHHH', c, 0, snapshot.title_id, snapshot.version, 0x82, 0, 0x18, 1, 0)
-    # Minimal AddOnContent extended header: original application ID, unknown
-    # required application version/accessibilities/data-patch ID left at zero.
-    c += struct.pack('<QIB3xQ', snapshot.base_id, 0, 0, 0)
-    c += digest + digest[:16] + data.size.to_bytes(6, 'little') + bytes([2, 0])
-    c += fmt.sha(c)
-    meta = fmt.nca([fmt.pfs_section(fmt.filesystem([(f'AddOnContent_{snapshot.title_id:016x}.cnmt', c)]))],
-                   snapshot.title_id, 1, 0)
-    image = fmt.package([(name, data), (meta.digest()[:16].hex()+'.cnmt.nca', meta)], kind)
+    image = build_image(romfs, snapshot.title_id, snapshot.version, lambda: phase.__setitem__(slice(None), [24, 44, 'Hashing DLC content']))
     temporary = output.with_name(output.name+'.'+uuid.uuid4().hex[:10]+'.partial')
     captured = {p: None for p in sources} if verify_output else None
     h = hashlib.sha256()

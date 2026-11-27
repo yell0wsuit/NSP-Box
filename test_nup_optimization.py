@@ -115,6 +115,38 @@ class NupOptimizationTests(unittest.TestCase):
             for i in (0,count//2,count-1):
                 self.assertEqual(actual[f'romfs/group{i//1000:04d}/file{i:07d}.bin'].read_small(),struct.pack('<Q',i)+b'payload')
         print(f'High-file-count stress: {count} files; pack {packed-start:.2f}s; convert {converted-packed:.2f}s',flush=True)
+    def test_contiguous_dlc_matches_legacy(self):
+        files={'romfs/z':nf.Source.data(b'z'),'romfs/a/one':nf.Source.data(b'a'),
+               'romfs/a/two':nf.Source.data(b''),'romfs/日本語/x':nf.Source.data(b'xyz')}
+        archive=self.root/'dlc.nup';nf.pack([nf.Package(TID+0x1001,3,2,files)],archive)
+        a=self.root/'old-dlc.nsp';b=self.root/'new-dlc.nsp'
+        nt.nup_to_nsp(archive,a,contiguous=False)
+        original_open=Path.open
+        def guarded(path,*args,**kwargs):
+            if any(part.startswith('.nup-nsp-') for part in path.parts) and 'romfs' in path.parts:
+                raise AssertionError('Physical DLC RomFS file opened')
+            return original_open(path,*args,**kwargs)
+        with patch.object(Path,'open',guarded):nt.nup_to_nsp(archive,b)
+        self.assertEqual(a.read_bytes(),b.read_bytes())
+    def test_contiguous_dlc_high_file_count(self):
+        import time
+        count=100000
+        files={f'romfs/group{i//1000:04d}/file{i:07d}':nf.Source.data(struct.pack('<Q',i)) for i in range(count)}
+        archive=self.root/'stress-dlc.nup';output=self.root/'stress-dlc.nsp'
+        start=time.perf_counter();nf.pack([nf.Package(TID+0x1001,0,2,files)],archive)
+        packed=time.perf_counter()
+        original_open=Path.open
+        def guarded(path,*args,**kwargs):
+            if any(part.startswith('.nup-nsp-') for part in path.parts) and 'romfs' in path.parts:
+                raise AssertionError('Physical DLC RomFS file opened')
+            return original_open(path,*args,**kwargs)
+        with patch.object(Path,'open',guarded):nt.nup_to_nsp(archive,output)
+        converted=time.perf_counter()
+        with nt.nsp_packages(output,deep=False) as packages:
+            self.assertEqual(packages[0].kind,2)
+            self.assertEqual(sum(n.startswith('romfs/') for n in packages[0].files),count)
+            self.assertEqual(packages[0].files['romfs/group0099/file0099999'].read_small(),struct.pack('<Q',99999))
+        print(f'DLC high-file-count stress: {count} files; pack {packed-start:.2f}s; convert {converted-packed:.2f}s',flush=True)
     def test_contiguous_matches_legacy(self):
         game=snapshot(self.root/'Game',{'z':b'z','a/one':b'a','a/two':b'','日本語/x':b'xyz'})
         archive=self.root/'fixture.nup';nt.pack_folder(game,archive)
@@ -158,7 +190,11 @@ class NupOptimizationTests(unittest.TestCase):
         self.assertFalse((self.root/'stale.nup').exists())
     def test_changed_cached_file_refused_and_partial_removed(self):
         game=snapshot(self.root/'Game',{'data':b'original'});prepared=nt.prepare_folder(game)
-        (game/'romfs/data').write_bytes(b'modified')
+        # Same-size mutation must have an observable timestamp change even on coarse clocks.
+        import os
+        source=game/'romfs/data';old=source.stat()
+        source.write_bytes(b'modified')
+        os.utime(source,ns=(old.st_atime_ns,old.st_mtime_ns+2_000_000_000))
         with self.assertRaisesRegex(ValueError,'changed'):nt.pack_folder(game,self.root/'stale.nup',prepared=prepared)
         self.assertFalse((self.root/'stale.nup').exists());self.assertFalse(list(self.root.glob('*.partial')))
     def test_nsp_headers_support_40_and_96_gib_without_allocating_payloads(self):
