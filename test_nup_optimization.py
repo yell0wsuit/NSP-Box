@@ -23,7 +23,11 @@ class NupOptimizationTests(unittest.TestCase):
         first=b'a'*(1024*1024);different=first[:65536]+b'b'*(len(first)-65536)
         files={'romfs/a':nf.Source.data(first),'romfs/b':nf.Source.data(first),'romfs/c':nf.Source.data(different)}
         compressor=nf.zstd.ZstdCompressor;calls=[]
-        def factory(*a,**kw):calls.append(kw.get('level'));return compressor(*a,**kw)
+        class CountingCompressor:
+            def __init__(self,*a,**kw):self.inner=compressor(*a,**kw)
+            def compress(self,data):calls.append(len(data));return self.inner.compress(data)
+            def compressobj(self,*a,**kw):calls.append(kw.get('size'));return self.inner.compressobj(*a,**kw)
+        def factory(*a,**kw):return CountingCompressor(*a,**kw)
         path=self.root/'duplicates.nup'
         with patch.object(nf.zstd,'ZstdCompressor',factory):result=nf.pack([nf.Package(TID,0,0,files)],path)
         self.assertEqual(len(calls),2);self.assertEqual(result['duplicate_files_skipped'],1)
@@ -79,6 +83,14 @@ class NupOptimizationTests(unittest.TestCase):
             dest=self.root/f'extracted-{workers}';nf.extract(path,dest,workers=workers)
             for name,source in files.items():
                 self.assertEqual((dest/'base'/name).read_bytes(),source.read_small())
+    def test_large_native_compression_round_trip(self):
+        data=b'large native frame'*(2*1024*1024)
+        path=self.root/'native.nup'
+        nf.pack([nf.Package(TID,0,0,{'romfs/data':nf.Source.data(data)})],path,workers=2,large_raw=False)
+        with nf.Archive(path) as a:
+            self.assertEqual(a.files[0][5],1)
+            self.assertTrue(a.verify()['verified'])
+            self.assertEqual(b''.join(a.file_chunks(0)),data)
     def test_small_snapshot_keeps_base_only_and_discards_old_replacements(self):
         root=self.root/'Bundle';snapshot(root/'base',{'same':b'old','needed':b'keep'})
         snapshot(root/'updates/65536',{'same':b'older update','obsolete':b'old update only'},1)
