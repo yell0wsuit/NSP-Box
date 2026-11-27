@@ -41,6 +41,13 @@ class VerificationSafetyTests(unittest.TestCase):
             if stage=='Verifying container integrity':(self.game/'romfs/data.bin').write_bytes(b'changed')
         with self.assertRaisesRegex(ValueError,'changed'):engine.build(self.snapshot,self.out,'Example','1',notify=notify)
         self.assertFalse(self.out.exists())
+    def test_parallel_block_hashes_match_serial(self):
+        path=self.root/'blocks.bin';path.write_bytes(b'abcdefgh'*(1024*1024)+b'tail')
+        with path.open('rb') as f,mmap.mmap(f.fileno(),0,access=mmap.ACCESS_READ) as mm:
+            region=verifier.Region(mm)
+            for padded in (False,True):
+                self.assertEqual(list(verifier.block_digests(region,4096,padded,workers=1)),
+                                 list(verifier.block_digests(region,4096,padded,workers=4)))
     def test_failed_block_hash_releases_mmap(self):
         fmt.configure();header,section=fmt.romfs_section(fmt.Blob(b'a'*50000))
         blob=fmt.nca([(header,section)],self.snapshot.title_id,0)

@@ -2,6 +2,8 @@
 import hashlib,json,mmap,struct,sys,time
 from pathlib import Path
 from contextlib import closing
+from concurrent.futures import ThreadPoolExecutor
+import os
 
 def checkpoint(): pass
 
@@ -44,7 +46,34 @@ def digest(buf):
     else:h.update(buf)
     return h.digest()
 
-def block_digests(buf,block_size,padded=False):
+def block_digests(buf,block_size,padded=False,workers=None):
+    workers=min(4,os.cpu_count() or 1) if workers is None else max(1,workers)
+    # Batch adjacent blocks; bound outstanding work and join before mmap closes.
+    if isinstance(buf,Region) and workers>1 and len(buf)>=8*1024*1024 and block_size>=2048:
+        batch=max(1,(1024*1024)//block_size)*block_size
+        def hash_batch(start):
+            result=[]
+            with memoryview(buf.mapping) as mapped:
+                for off in range(start,min(start+batch,len(buf)),block_size):
+                    count=min(block_size,len(buf)-off)
+                    with mapped[buf.offset+off:buf.offset+off+count] as chunk:h=hashlib.sha256(chunk)
+                    if padded and count<block_size:h.update(bytes(block_size-count))
+                    result.append(h.digest())
+            return result
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            starts=iter(range(0,len(buf),batch))
+            while True:
+                checkpoint()
+                group=[]
+                for _ in range(workers*2):
+                    start=next(starts,None)
+                    if start is None:break
+                    group.append(pool.submit(hash_batch,start))
+                if not group:break
+                for future in group:
+                    checkpoint()
+                    yield from future.result()
+        return
     if isinstance(buf,Region):
         with memoryview(buf.mapping) as mapped:
             for k,off in enumerate(range(0,len(buf),block_size)):
