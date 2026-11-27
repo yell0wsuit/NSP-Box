@@ -6,7 +6,7 @@ All public operations use bounded reads, cancellation and exclusive final commit
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from contextlib import contextmanager
-import base64, hashlib, io, json, os, re, shutil, stat, struct, tempfile, unicodedata, uuid
+import base64, hashlib, io, json, os, re, shutil, stat, struct, tempfile, unicodedata, uuid, time
 import zstandard as zstd
 
 BLOCK=1024*1024
@@ -383,15 +383,51 @@ class Archive:
                 check(self.cancel);count+=len(b);require(count<=size,'Decompressed file exceeds its declared size.');h.update(b);yield b
         require(count==size and h.digest()==digest,'File SHA-256 mismatch: '+self.files[index][0])
     def verify(self,notify=lambda *a:None):
-        total=self.stats['uncompressed'];done=0;verified_extents=set()
+        """Read each unique extent in physical order using a shared buffer/handle."""
+        total=self.stats['uncompressed'];done=0;unique={}
+        self.unchanged()
         for i,file in enumerate(self.files):
-            check(self.cancel);key=file[1:]
-            if key in verified_extents:done+=file[1]
-            else:
-                for b in self.file_chunks(i):done+=len(b);notify('Verifying NUP files',100*done/max(total,1))
-                verified_extents.add(key)
-            notify('Verifying NUP files',100*done/max(total,1))
-        self.unchanged();return dict(self.stats,verified=True)
+            check(self.cancel)
+            key=file[1:]
+            if key in unique:unique[key][1]+=file[1]
+            else:unique[key]=[i,file[1]]
+        buffer=bytearray(BLOCK);last=0.0
+        decoder=zstd.ZstdDecompressor(max_window_size=MAX_ZSTD_WINDOW)
+        def report():
+            nonlocal last
+            now=time.monotonic()
+            if now-last>=0.1:
+                notify('Verifying NUP files',100*done/max(total,1));last=now
+        with memoryview(buffer) as view:
+            for i,logical_size in sorted(unique.values(),key=lambda item:self.files[item[0]][2]):
+                check(self.cancel)
+                name,size,off,stored,expected,codec=self.files[i]
+                h=hashlib.sha256();count=0
+                if not codec:
+                    self.f.seek(off)
+                    while count<size:
+                        check(self.cancel)
+                        with view[:min(BLOCK,size-count)] as target:
+                            n=self.f.readinto(target)
+                            require(n>0,'Truncated archive.')
+                            with target[:n] as chunk:h.update(chunk)
+                        count+=n;done+=n;report()
+                else:
+                    with Slice(self.path,off,stored) as raw:
+                        with decoder.stream_reader(raw,read_across_frames=False,closefd=False) as reader:
+                            while True:
+                                check(self.cancel)
+                                with view[:min(BLOCK,size-count+1)] as target:
+                                    n=reader.readinto(target)
+                                    if not n:break
+                                    require(n<=size-count,'Decompressed file exceeds its declared size.')
+                                    with target[:n] as chunk:h.update(chunk)
+                                count+=n;done+=n;report()
+                require(count==size and h.digest()==expected,'File SHA-256 mismatch: '+name)
+                done+=logical_size-size;report()
+        self.unchanged();check(self.cancel)
+        notify('Verifying NUP files',100)
+        return dict(self.stats,verified=True)
     def inspect(self):
         return dict(self.stats,packages_info=[{'index':i,'kind':KINDS[p.kind],'title_id':f'{p.title_id:016X}','version':p.version,'flags':p.flags,
           'files':len(p.files),'metadata_types':[f'{t:04X}' for t,d in p.metadata],
