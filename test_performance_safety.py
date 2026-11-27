@@ -60,6 +60,24 @@ class VerificationSafetyTests(unittest.TestCase):
                 self.assertEqual(dict(verifier.compare_files(dict(a='a',b='b'),packed,expected.get,workers=workers)),expected)
             with closing(verifier.compare_files(dict(a='a',b='b'),packed,lambda _:bytes(32),workers=4)) as results:
                 with self.assertRaises(AssertionError):list(results)
+    def test_fused_nca_hash_and_integrity(self):
+        import hashlib
+        fmt.configure()
+        header,section=fmt.romfs_section(fmt.Blob(b'abcdefgh'*(1200000)))
+        blob=fmt.nca([(header,section)],self.snapshot.title_id,0)
+        path=self.root/'fused.nca'
+        with path.open('wb') as f:
+            for chunk in blob.chunks():f.write(chunk)
+        with path.open('rb') as f,mmap.mmap(f.fileno(),0,access=mmap.ACCESS_READ) as mm:
+            region=verifier.Region(mm);expected=verifier.digest(region)
+            for workers in (1,4):
+                actual,parsed=verifier.verified_nca(region,workers=workers)
+                self.assertEqual(actual,expected)
+                self.assertEqual(parsed[:2],verifier.nca_sections(region)[:2])
+        start=0xc00+struct.unpack_from('<Q',header,0x18+5*24)[0]
+        with path.open('r+b') as f:f.seek(start);f.write(b'X')
+        with path.open('rb') as f,mmap.mmap(f.fileno(),0,access=mmap.ACCESS_READ) as mm:
+            with self.assertRaises(AssertionError):verifier.verified_nca(verifier.Region(mm),workers=4)
     def test_failed_block_hash_releases_mmap(self):
         fmt.configure();header,section=fmt.romfs_section(fmt.Blob(b'a'*50000))
         blob=fmt.nca([(header,section)],self.snapshot.title_id,0)
