@@ -339,7 +339,7 @@ def build_snapshot_nsp(package,output,verify=True,notify=lambda *a:None,cancel=N
     fmt.configure(cancel,report)
     with tempfile.TemporaryDirectory(prefix='.nup-nsp-',dir=output.parent) as work:
         root=Path(work);total=sum(s.size for s in package.files.values());done=0;expected_hashes={};last=0.0
-        indexed=contiguous and package.kind!=2
+        indexed=contiguous
         rom_sources={name[6:]:source for name,source in package.files.items() if name.startswith('romfs/')} if indexed else {}
         for name,source in package.files.items():
             if indexed and name.startswith('romfs/'):continue
@@ -355,41 +355,6 @@ def build_snapshot_nsp(package,output,verify=True,notify=lambda *a:None,cancel=N
                     if now-last>=0.1:notify('Preparing snapshot',20*done/max(total,1));last=now
             require(count==source.size,'Incomplete snapshot file.');source.validate()
             if verify:expected_hashes[name]=h.digest()
-        if package.kind==2:
-            import dlc
-            return dlc.build(dlc.DlcSnapshot(root,package.title_id,package.version,'NUP DLC'),output,verify_output=verify,notify=notify,cancel=cancel)
-        control=root/'data/control'
-        original=next((d for t,d in package.metadata if t==2),None)
-        # Presentation TLVs are authoritative when supplied. Folder packing can
-        # override them without modifying the original archived filesystem.
-        if original is not None:
-            require(len(original)==0x4000,'Original NACP is not a supported 0x4000-byte control record.')
-            control.mkdir(parents=True,exist_ok=True);(control/'control.nacp').write_bytes(original)
-        if not (control/'control.nacp').is_file():
-            control.mkdir(parents=True,exist_ok=True)
-            original=next((d for t,d in package.metadata if t==2),None)
-            if original is None:
-                for p in (root/'control/control.nacp',root/'control.nacp'):
-                    if p.is_file():original=p.read_bytes();break
-            if original is None:
-                title=next((d.decode('utf-8','replace') for t,d in package.metadata if t==5),'NUP game')
-                display=next((d.decode('utf-8','replace') for t,d in package.metadata if t==4),'Snapshot')
-                entries,_=engine.control_data(engine.Snapshot(root,package.title_id,package.version,'NUP',title),title,display,None)
-                original=dict(entries)['control.nacp']
-            require(len(original)==0x4000,'Original NACP is not a supported 0x4000-byte control record.')
-            (control/'control.nacp').write_bytes(original)
-        icon=next((d for t,d in package.metadata if t==3),None)
-        if icon is not None:(control/'icon_AmericanEnglish.dat').write_bytes(icon)
-        expected_files=dict(package.files)
-        if original is not None:
-            expected_files['data/control/control.nacp']=Source.data(original)
-            expected_hashes['data/control/control.nacp']=hashlib.sha256(original).digest()
-        if icon is not None:
-            expected_files['data/control/icon_AmericanEnglish.dat']=Source.data(icon)
-            expected_hashes['data/control/icon_AmericanEnglish.dat']=hashlib.sha256(icon).digest()
-        exefs=root/'exefs';romfs=root/'romfs'
-        require(exefs.is_dir() and (bool(rom_sources) if indexed else romfs.is_dir()),'Missing complete ExeFS/RomFS snapshot.')
-        require(all(p.is_file() for p in exefs.iterdir()),'Nested ExeFS directories are unsupported by NSP.')
         if indexed:
             from contextlib import ExitStack
             import zstandard as zstd
@@ -424,18 +389,61 @@ def build_snapshot_nsp(package,output,verify=True,notify=lambda *a:None,cancel=N
                 for archive in handles:archive.unchanged()
                 if verify:expected_hashes.update(('romfs/'+name,hashes_by_source[id(source)]) for name,source in rom_sources.items())
             phase[:]=[30,50,'Building NSP integrity trees'];last_progress=30
+        if package.kind==2 and not indexed:
+            import dlc
+            return dlc.build(dlc.DlcSnapshot(root,package.title_id,package.version,'NUP DLC'),output,verify_output=verify,notify=notify,cancel=cancel)
+        if package.kind==2:
+            import dlc
+            require(bool(rom_sources),'Missing complete DLC RomFS snapshot.')
+            expected_files={name:source for name,source in package.files.items() if name.startswith('romfs/')}
+            def hashing():
+                nonlocal last_progress
+                phase[:]=[50,60,'Hashing DLC content'];last_progress=50
+            blob=dlc.build_image(rblob,package.title_id,package.version,hashing)
         else:
-            rblob=fmt.romfs(romfs,[])
-        program=fmt.nca([fmt.pfs_section(fmt.filesystem([(p.name,p) for p in sorted(exefs.iterdir())])),fmt.romfs_section(rblob)],package.title_id,0,0)
-        control_nca=fmt.nca([fmt.romfs_section(fmt.romfs(control,[]))],package.title_id,2,0)
-        records=[];entries=[]
-        phase[:]=[50,60,'Hashing NSP content'];last_progress=50
-        for blob,ctype in ((program,1),(control_nca,3)):
-            digest=blob.digest();entries.append((digest[:16].hex()+'.nca',blob));records.append(digest+digest[:16]+blob.size.to_bytes(6,'little')+bytes([ctype,0]))
-        cnmt=bytearray(0x20);struct.pack_into('<QIBBHHH',cnmt,0,package.title_id,package.version,0x80,0,16,len(records),0)
-        cnmt+=struct.pack('<QII',package.title_id+0x800,0,0)+b''.join(records);cnmt+=fmt.sha(cnmt)
-        meta=fmt.nca([fmt.pfs_section(fmt.filesystem([(f'Application_{package.title_id:016x}.cnmt',bytes(cnmt))]))],package.title_id,1,0)
-        entries.append((meta.digest()[:16].hex()+'.cnmt.nca',meta));blob=fmt.package(entries,'nsp')
+            control=root/'data/control'
+            original=next((d for t,d in package.metadata if t==2),None)
+            # Presentation TLVs are authoritative when supplied. Folder packing can
+            # override them without modifying the original archived filesystem.
+            if original is not None:
+                require(len(original)==0x4000,'Original NACP is not a supported 0x4000-byte control record.')
+                control.mkdir(parents=True,exist_ok=True);(control/'control.nacp').write_bytes(original)
+            if not (control/'control.nacp').is_file():
+                control.mkdir(parents=True,exist_ok=True)
+                original=next((d for t,d in package.metadata if t==2),None)
+                if original is None:
+                    for p in (root/'control/control.nacp',root/'control.nacp'):
+                        if p.is_file():original=p.read_bytes();break
+                if original is None:
+                    title=next((d.decode('utf-8','replace') for t,d in package.metadata if t==5),'NUP game')
+                    display=next((d.decode('utf-8','replace') for t,d in package.metadata if t==4),'Snapshot')
+                    entries,_=engine.control_data(engine.Snapshot(root,package.title_id,package.version,'NUP',title),title,display,None)
+                    original=dict(entries)['control.nacp']
+                require(len(original)==0x4000,'Original NACP is not a supported 0x4000-byte control record.')
+                (control/'control.nacp').write_bytes(original)
+            icon=next((d for t,d in package.metadata if t==3),None)
+            if icon is not None:(control/'icon_AmericanEnglish.dat').write_bytes(icon)
+            expected_files=dict(package.files)
+            if original is not None:
+                expected_files['data/control/control.nacp']=Source.data(original)
+                expected_hashes['data/control/control.nacp']=hashlib.sha256(original).digest()
+            if icon is not None:
+                expected_files['data/control/icon_AmericanEnglish.dat']=Source.data(icon)
+                expected_hashes['data/control/icon_AmericanEnglish.dat']=hashlib.sha256(icon).digest()
+            exefs=root/'exefs';romfs=root/'romfs'
+            require(exefs.is_dir() and (bool(rom_sources) if indexed else romfs.is_dir()),'Missing complete ExeFS/RomFS snapshot.')
+            require(all(p.is_file() for p in exefs.iterdir()),'Nested ExeFS directories are unsupported by NSP.')
+            if not indexed:rblob=fmt.romfs(romfs,[])
+            program=fmt.nca([fmt.pfs_section(fmt.filesystem([(p.name,p) for p in sorted(exefs.iterdir())])),fmt.romfs_section(rblob)],package.title_id,0,0)
+            control_nca=fmt.nca([fmt.romfs_section(fmt.romfs(control,[]))],package.title_id,2,0)
+            records=[];entries=[]
+            phase[:]=[50,60,'Hashing NSP content'];last_progress=50
+            for blob,ctype in ((program,1),(control_nca,3)):
+                digest=blob.digest();entries.append((digest[:16].hex()+'.nca',blob));records.append(digest+digest[:16]+blob.size.to_bytes(6,'little')+bytes([ctype,0]))
+            cnmt=bytearray(0x20);struct.pack_into('<QIBBHHH',cnmt,0,package.title_id,package.version,0x80,0,16,len(records),0)
+            cnmt+=struct.pack('<QII',package.title_id+0x800,0,0)+b''.join(records);cnmt+=fmt.sha(cnmt)
+            meta=fmt.nca([fmt.pfs_section(fmt.filesystem([(f'Application_{package.title_id:016x}.cnmt',bytes(cnmt))]))],package.title_id,1,0)
+            entries.append((meta.digest()[:16].hex()+'.cnmt.nca',meta));blob=fmt.package(entries,'nsp')
         temp=output.with_name(output.name+'.'+uuid.uuid4().hex[:10]+'.partial')
         try:
             with temp.open('xb') as out:
