@@ -133,3 +133,9 @@ Full application source, icon assets and synthetic tests are available in the se
 You may redistribute the app and source with the required license notices. The software was developed with AI assistance. This package includes no Nintendo code, game data, game cover artwork, console firmware, tickets, certificates, or Nintendo cryptographic keys. Use your own extracted data and artwork; redistribution rights for input/output content are separate from the app's license.
 
 See `TECHNICAL_NOTES.md` for implementation details and `BUILD.md` in the source ZIP to rebuild the EXE. See `GITHUB_RELEASES.md` for publishing future versions.
+
+### NUP conversion temporary storage
+
+For NUP → NSP, choose **Temporary storage → Choose folder** to stage the RomFS on an existing SSD folder. The final NSP remains beside the source. **Default** restores staging beside the output. The selected directory is used only for temporary working files, which are removed after completion or handled cancellation. Allow free space for the largest package on the staging drive and the reconstructed NSPs on the output drive.
+
+CLI: `NSP-Box.exe --nup-operation nup-to-nsp --input game.nup --output game.nsp --staging-dir D:\\Scratch`

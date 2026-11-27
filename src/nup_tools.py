@@ -328,7 +328,7 @@ def compact_packages(packages):
     merged=merge_game(packages)
     return [merged]+[p for p in packages if p.kind not in (0,1)]
 
-def build_snapshot_nsp(package,output,verify=True,notify=lambda *a:None,cancel=None,contiguous=True):
+def build_snapshot_nsp(package,output,verify=True,notify=lambda *a:None,cancel=None,contiguous=True,staging_dir=None):
     """Rebuild a snapshot, honoring explicit presentation metadata overrides."""
     output=Path(output);require(not output.exists(),'NSP output already exists.')
     phase=[20,45,'Building NSP integrity trees'];last_progress=20
@@ -337,7 +337,7 @@ def build_snapshot_nsp(package,output,verify=True,notify=lambda *a:None,cancel=N
         last_progress=max(last_progress,phase[0]+(phase[1]-phase[0])*done/max(total,1))
         notify(phase[2],last_progress)
     fmt.configure(cancel,report)
-    with tempfile.TemporaryDirectory(prefix='.nup-nsp-',dir=output.parent) as work:
+    with tempfile.TemporaryDirectory(prefix='.nup-nsp-',dir=output.parent if staging_dir is None else staging_dir) as work:
         root=Path(work);total=sum(s.size for s in package.files.values());done=0;expected_hashes={};last=0.0
         indexed=contiguous
         rom_sources={name[6:]:source for name,source in package.files.items() if name.startswith('romfs/')} if indexed else {}
@@ -472,10 +472,13 @@ def build_snapshot_nsp(package,output,verify=True,notify=lambda *a:None,cancel=N
         finally:
             if temp.exists():temp.unlink()
 
-def nup_to_nsp(path,output,selection=None,verify=True,notify=lambda *a:None,cancel=None,include_kinds=None,contiguous=True):
+def nup_to_nsp(path,output,selection=None,verify=True,notify=lambda *a:None,cancel=None,include_kinds=None,contiguous=True,staging_dir=None):
     """Whole archive -> game+highest update and separate DLC NSPs, or one package."""
     output=Path(output).absolute();require(not output.exists(),'Output already exists; choose a new path.')
     output.parent.mkdir(parents=True,exist_ok=True)
+    staging=output.parent.resolve() if staging_dir is None else Path(staging_dir).expanduser().resolve()
+    require(staging.is_dir(),'Choose an existing temporary storage folder.')
+    require(not staging.is_relative_to(output.resolve()),'Temporary storage must be outside the output path.')
     with Archive(path,cancel) as archive:
         archive.verify(lambda s,v:notify(s,v*.1))
         if selection is None:
@@ -491,17 +494,29 @@ def nup_to_nsp(path,output,selection=None,verify=True,notify=lambda *a:None,canc
             packages=[p if p.kind==2 else merge_game(archive.packages,selection)]
         require(packages,'No convertible content packages found.')
         total=sum(s.size for p in packages for s in p.files.values())
-        require(shutil.disk_usage(output.parent).free>total*2.1+64*1024*1024,'NSP conversion needs space for a temporary extracted snapshot and the output.')
+        # Keep final partial files beside their destination for exclusive atomic commit.
+        # A separate staging drive only needs the largest package's working payload.
+        largest=max(sum(s.size for s in p.files.values()) for p in packages)
+        # Include alignment and metadata overhead for tiny-file-heavy archives.
+        overhead=sum(len(p.files)*256+sum(len(n.encode('utf-8')) for n in p.files) for p in packages)
+        staging_need=largest+overhead+32*1024*1024
+        output_need=int(total*1.05)+overhead+32*1024*1024
+        same_volume=os.stat(staging).st_dev==os.stat(output.parent).st_dev
+        if same_volume:
+            require(shutil.disk_usage(staging).free>staging_need+output_need,'Not enough space for temporary staging and NSP output on this drive.')
+        else:
+            require(shutil.disk_usage(staging).free>staging_need,'Not enough free space on the temporary storage drive.')
+            require(shutil.disk_usage(output.parent).free>output_need,'Not enough free space on the NSP output drive.')
         require(len(packages)==1 or output.suffix.lower()!='.nsp','A game plus DLC needs a new output folder, not one .nsp filename.')
         single=output.suffix.lower()=='.nsp'
         if single:
-            result=build_snapshot_nsp(packages[0],output,verify,lambda s,v:notify(s,10+89*v/100),cancel,contiguous);archive.unchanged();notify('NSP ready',100);return result
+            result=build_snapshot_nsp(packages[0],output,verify,lambda s,v:notify(s,10+89*v/100),cancel,contiguous,staging);archive.unchanged();notify('NSP ready',100);return result
         stage=Path(tempfile.mkdtemp(prefix='.nup-convert-',dir=output.parent))
         try:
             results=[]
             for i,p in enumerate(packages):
                 check(cancel);name=f'{"DLC" if p.kind==2 else "Game"} [{p.title_id:016X}] v{p.version}.nsp'
-                result=build_snapshot_nsp(p,stage/name,verify,lambda s,v:notify(s,10+89*(i+v/100)/len(packages)),cancel,contiguous);results.append(result)
+                result=build_snapshot_nsp(p,stage/name,verify,lambda s,v:notify(s,10+89*(i+v/100)/len(packages)),cancel,contiguous,staging);results.append(result)
             archive.unchanged();check(cancel);stage.rename(output);notify('NSP conversion complete',100)
             return {'output':str(output),'size':sum(r['size'] for r in results),'verified':verify,'packages':len(results)}
         finally:

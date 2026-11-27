@@ -49,6 +49,18 @@ class NupInterfaceTests(unittest.TestCase):
         self.assertFalse((output/'base').exists())
         self.assertEqual(list(output.rglob('addon'))[0].read_bytes(),b'dlc')
         self.assertFalse(self.errors)
+    def test_conversion_staging_selector(self):
+        import nup_tools as nt
+        p=self.app.nup_panel;archive=self.root/'Game.nup';nt.pack_folder(self.game,archive)
+        staging=self.root/'SSD';staging.mkdir()
+        p.operation.set(OPERATIONS[3]);p.input.set(str(archive));p.changed();p.scan();self.until(lambda:not p.busy)
+        with patch('nup_panel.filedialog.askdirectory',return_value=str(staging)):p.pick_staging()
+        self.assertEqual(p.staging_dir.get(),str(staging))
+        self.assertTrue(p.staging_button.enabled)
+        p.start();self.until(lambda:not p.busy)
+        self.assertTrue((self.root/'Game-NSP').is_dir(),p.status.get())
+        self.assertEqual(list(staging.iterdir()),[])
+        self.assertFalse(self.errors)
     def test_minimum_layout_and_operation_controls(self):
         app=self.app;p=app.nup_panel;app.geometry('1010x830');self.pump(.2)
         self.assertFalse(p.include_area.winfo_ismapped());self.assertFalse(p.snapshot_check.winfo_ismapped())

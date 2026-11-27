@@ -12,17 +12,19 @@ def main(argv):
     parser.add_argument('--large-files-raw',action=argparse.BooleanOptionalAction,default=True)
     parser.add_argument('--latest-snapshot',action=argparse.BooleanOptionalAction,default=True,help='Folder packing: keep one latest game snapshot; --no-latest-snapshot archives all game versions.')
     parser.add_argument('--verify',action=argparse.BooleanOptionalAction,default=True)
+    parser.add_argument('--staging-dir',type=Path,help='Existing temporary storage folder for NUP-to-NSP (default: beside output).')
     parser.add_argument('--package-index',type=int);parser.add_argument('--result-json',type=Path)
     args=parser.parse_args(argv)
     try:
         op=args.nup_operation
+        if args.staging_dir is not None and op!='nup-to-nsp':raise ValueError('--staging-dir is only supported for nup-to-nsp.')
         if op in ('pack','nsp-to-nup','extract','nup-to-nsp') and args.output is None:raise ValueError('Choose --output.')
         if op in ('pack','nsp-to-nup'):
             fn=tools.pack_folder if op=='pack' else tools.nsp_to_nup
             extra={'latest_snapshot':args.latest_snapshot} if op=='pack' else {}
             result=fn(args.input,args.output,level=PRESETS[args.preset],large_raw=args.large_files_raw,verify=args.verify,**extra)
         elif op=='extract':result=tools.extract(args.input,args.output,selection=None if args.package_index is None else [args.package_index])
-        elif op=='nup-to-nsp':result=tools.nup_to_nsp(args.input,args.output,selection=args.package_index,verify=args.verify)
+        elif op=='nup-to-nsp':result=tools.nup_to_nsp(args.input,args.output,selection=args.package_index,verify=args.verify,staging_dir=args.staging_dir)
         else:result=tools.inspect(args.input,verify=op=='verify')
         code=0
     except Exception as error:result={'error':str(error)};code=1

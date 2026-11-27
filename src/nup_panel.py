@@ -31,6 +31,7 @@ class NupPanel(AmbientFrame):
         self.operation=tk.StringVar(self,value=OPERATIONS[0]);self.input=tk.StringVar(self);self.output=tk.StringVar(self)
         self.preset=tk.StringVar(self,value='Balanced');self.large_raw=tk.BooleanVar(self,value=True);self.verify=tk.BooleanVar(self,value=True)
         self.latest_snapshot=tk.BooleanVar(self,value=True)
+        self.staging_dir=tk.StringVar(self)
         self.includes={name:tk.BooleanVar(self,value=True) for name in ('Base','Updates','DLC')}
         self.title_text=tk.StringVar(self);self.art_selection=None;self.art_bytes=None;self._art_editor=None
         self.art_name=tk.StringVar(self,value='Optional · square cover');self.reveal_height=0
@@ -100,7 +101,20 @@ class NupPanel(AmbientFrame):
         self.label(options.inner,'Extraction always checks hashes. Inspect / Verify uses this option for full verification.',wraplength=275,justify='left').pack(anchor='w',pady=(6,14))
         self.label(options.inner,'Output · automatic',color=TEXT,size=10).pack(anchor='w',pady=(2,6))
         self.output_label=self.label(options.inner,variable=self.destination,wraplength=275,justify='left',size=9);self.output_label.pack(anchor='w',pady=(0,14))
-        self.label(options.inner,'NUP compatibility',color='#b9d8ff',size=10).pack(anchor='w',pady=(2,6))
+        self.staging_options=tk.Frame(options.inner,bg=PANEL)
+        self.label(self.staging_options,'Temporary storage',color=TEXT,size=10).pack(anchor='w',pady=(0,4))
+        self.staging_label=self.label(self.staging_options,variable=self.staging_dir,wraplength=275,justify='left',size=9)
+        self.staging_label.pack(anchor='w')
+        self.staging_hint=self.label(self.staging_options,'Default: output drive. Select an SSD to reduce HDD contention.',wraplength=275,justify='left',size=8)
+        self.staging_hint.pack(anchor='w',pady=(2,4))
+        staging_buttons=tk.Frame(self.staging_options,bg=PANEL);staging_buttons.pack(fill='x')
+        self.staging_button=Button(staging_buttons,'Choose folder',self.pick_staging,self.motion,width=142,height=34,kind='folder')
+        self.staging_button.pack(side='left')
+        self.staging_reset=Button(staging_buttons,'Default',lambda:self.staging_dir.set(''),self.motion,width=90,height=34,quiet=True)
+        self.staging_reset.pack(side='left',padx=(6,0))
+        self.controls.extend((self.staging_button,self.staging_reset))
+        self.compatibility_heading=self.label(options.inner,'NUP compatibility',color='#b9d8ff',size=10)
+        self.compatibility_heading.pack(anchor='w',pady=(2,6))
         self.label(options.inner,'Plaintext inputs only. Requires a NUP-capable emulator.\n\nDLC mounting depends on the emulator; convert DLC to NSP to install it where needed.',wraplength=275,justify='left').pack(anchor='w')
         self.panels=[source,packages,options]
         self.progress=Progress(self,self.motion);self.progress.pack(fill='x')
@@ -168,12 +182,20 @@ class NupPanel(AmbientFrame):
     def update_controls(self):
         packing=self.operation.get() in OPERATIONS[:2];folder=self.operation.get()==OPERATIONS[0]
         self.refresh_includes()
+        if self.operation.get()==OPERATIONS[3]:
+            if not self.staging_options.winfo_manager():self.staging_options.pack(fill='x',before=self.compatibility_heading,pady=(0,8))
+        else:self.staging_options.pack_forget()
+        for control in (self.staging_button,self.staging_reset):control.configure(state='normal' if self.operation.get()==OPERATIONS[3] and not self.busy else 'disabled')
         for op,button in zip(OPERATIONS,self.op_buttons):button.configure(state='disabled' if self.busy else 'normal');button.set_selected(op==self.operation.get())
         for name,button in zip(PRESETS,self.preset_buttons):button.configure(state='normal' if packing and not self.busy else 'disabled');button.set_selected(name==self.preset.get())
         self.large_check.configure(state='normal' if packing and not self.busy else 'disabled')
         self.snapshot_check.configure(state='normal' if folder and not self.busy and self.includes['Updates'].get() else 'disabled')
         for control in self.include_checks:control.configure(state='disabled' if self.busy or self.operation.get()==OPERATIONS[4] else 'normal')
         for control in (self.title_entry,self.art_button,self.clear_art_button):control.configure(state='normal' if folder and not self.busy else 'disabled')
+    def pick_staging(self):
+        if self.busy:return
+        path=filedialog.askdirectory(parent=self,title='Choose temporary storage folder (SSD recommended)',mustexist=True)
+        if path:self.staging_dir.set(path)
     def pick_input(self):
         if self.operation.get()==OPERATIONS[0]:path=filedialog.askdirectory(parent=self,title='Choose extracted game or base/updates/dlc bundle')
         else:path=filedialog.askopenfilename(parent=self,title='Choose package',filetypes=[('NSP packages','*.nsp')] if self.operation.get()==OPERATIONS[1] else [('NUP archives','*.nup')])
@@ -245,7 +267,7 @@ class NupPanel(AmbientFrame):
         if op!=OPERATIONS[4] and not kinds:self.status.set('Select at least one of Base, Updates or DLC.');return
         self.update_destination();output=self.output.get()
         level=PRESETS[self.preset.get()];large=self.large_raw.get();latest=self.latest_snapshot.get();prepared=self.prepared
-        title=self.title_text.get();artwork=self.art_bytes;self.status.set('Preparing operation…')
+        title=self.title_text.get();artwork=self.art_bytes;staging=self.staging_dir.get() or None;self.status.set('Preparing operation…')
         candidate=Path(path).resolve()
         if candidate.name.lower() in ('exefs','romfs'):candidate=candidate.parent
         if prepared is not None and prepared.root!=candidate:prepared=None
@@ -256,7 +278,7 @@ class NupPanel(AmbientFrame):
             if op==OPERATIONS[2]:
                 with Archive(path,self.cancel_event) as archive:selection=[i for i,p in enumerate(archive.packages) if p.kind in kinds]
                 return tools.extract(path,output,selection=selection,**common)
-            if op==OPERATIONS[3]:return tools.nup_to_nsp(path,output,include_kinds=kinds,verify=verify,**common)
+            if op==OPERATIONS[3]:return tools.nup_to_nsp(path,output,include_kinds=kinds,verify=verify,staging_dir=staging,**common)
             return tools.inspect(path,verify=verify,**common)
         self.worker(call,'done')
     def show_report(self,data):

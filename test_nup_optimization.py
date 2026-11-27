@@ -147,6 +147,24 @@ class NupOptimizationTests(unittest.TestCase):
             self.assertEqual(sum(n.startswith('romfs/') for n in packages[0].files),count)
             self.assertEqual(packages[0].files['romfs/group0099/file0099999'].read_small(),struct.pack('<Q',99999))
         print(f'DLC high-file-count stress: {count} files; pack {packed-start:.2f}s; convert {converted-packed:.2f}s',flush=True)
+    def test_custom_staging_location_and_cleanup(self):
+        import threading
+        game=snapshot(self.root/'Game',{'data':b'payload'*20000})
+        archive=self.root/'fixture.nup';nt.pack_folder(game,archive)
+        staging=self.root/'SSD staging';staging.mkdir()
+        baseline=self.root/'baseline.nsp';nt.nup_to_nsp(archive,baseline)
+        output=self.root/'custom.nsp';seen=[]
+        def notify(stage,value):
+            if list(staging.glob('.nup-nsp-*')):seen.append(stage)
+        nt.nup_to_nsp(archive,output,staging_dir=staging,notify=notify)
+        self.assertTrue(seen);self.assertEqual(baseline.read_bytes(),output.read_bytes())
+        self.assertEqual(list(staging.iterdir()),[])
+        cancelled=self.root/'cancelled.nsp';event=threading.Event()
+        def stop(stage,value):
+            if stage=='Indexing RomFS files':event.set()
+        with self.assertRaises(InterruptedError):nt.nup_to_nsp(archive,cancelled,staging_dir=staging,cancel=event,notify=stop)
+        self.assertFalse(cancelled.exists());self.assertEqual(list(staging.iterdir()),[])
+        with self.assertRaisesRegex(ValueError,'existing temporary'):nt.nup_to_nsp(archive,self.root/'invalid.nsp',staging_dir=self.root/'missing')
     def test_contiguous_matches_legacy(self):
         game=snapshot(self.root/'Game',{'z':b'z','a/one':b'a','a/two':b'','日本語/x':b'xyz'})
         archive=self.root/'fixture.nup';nt.pack_folder(game,archive)
