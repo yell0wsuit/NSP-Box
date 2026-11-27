@@ -252,18 +252,18 @@ def pack(packages,output,level=3,large_raw=True,verify=True,notify=lambda *a:Non
                         if source.size==0:node[2:]=[0,0,digest,0]
                         else:node[2:]=[start,stored,digest,codec];seen[(digest,source.size)]=(start,stored,codec)
                 done+=source.size
-            with ThreadPoolExecutor(max_workers=workers) as pool:
+            with ThreadPoolExecutor(max_workers=workers) as executor:
                 batch=[];batch_size=0
                 for node in files:
                     check(cancel);size=node[1].size
-                    if workers==1 or size>8*BLOCK:
-                        if batch:small_batch(batch,pool);batch=[];batch_size=0
+                    if workers==1 or size>8*BLOCK or (large_raw and size>LARGE_FILE):
+                        if batch:small_batch(batch,executor);batch=[];batch_size=0
                         stream_node(node)
                     else:
                         if batch and (batch_size+size>32*BLOCK or len(batch)>=256):
-                            small_batch(batch,pool);batch=[];batch_size=0
+                            small_batch(batch,executor);batch=[];batch_size=0
                         batch.append(node);batch_size+=size
-                if batch:small_batch(batch,pool)
+                if batch:small_batch(batch,executor)
             meta=[]
             for p in packages:
                 data=tlv_bytes(p.metadata);require(len(data)<=32*1024*1024,'Package metadata exceeds 32 MiB.')
