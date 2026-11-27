@@ -308,6 +308,29 @@ def pack(packages,output,level=3,large_raw=True,verify=True,notify=lambda *a:Non
     finally:
         if temp.exists():temp.unlink()
 
+class ReadAhead:
+    """Bounded forward cache for nearby archive extents; random misses stay small."""
+    def __init__(self,handle,window=4*BLOCK):
+        self.handle=handle;self.window=window;self.pos=0;self.start=0;self.data=b'';self.end=None
+    def seek(self,offset):
+        self.pos=offset
+    def read(self,n):
+        if n<=0:return b''
+        pos=self.pos
+        if self.start<=pos and pos+n<=self.start+len(self.data):
+            data=self.data[pos-self.start:pos-self.start+n]
+        else:
+            nearby=self.end is not None and 0<=pos-self.end<=64*1024
+            self.handle.seek(pos)
+            if nearby and n<self.window:
+                self.start=pos;self.data=self.handle.read(self.window);data=self.data[:n]
+            else:
+                self.start=pos;self.data=b'';data=self.handle.read(n)
+        self.pos+=len(data);self.end=self.pos
+        return data
+    def readinto(self,target):
+        data=self.read(len(target));target[:len(data)]=data;return len(data)
+
 class Slice(io.RawIOBase):
     def __init__(self,path,offset,size,handle=None):
         self.owns_handle=handle is None;self.f=Path(path).open('rb') if handle is None else handle
