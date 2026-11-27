@@ -7,6 +7,10 @@ import os
 
 def checkpoint(): pass
 
+def require(condition,message='Invalid container structure'):
+    if not condition:raise AssertionError(message)
+
+
 class Region:
     """Bounded mmap range without exported buffer views; always safe to close."""
     def __init__(self,mapping,offset=0,size=None):
@@ -33,21 +37,22 @@ def u(fmt,buf,off=0):
         return struct.unpack_from('<'+fmt,buf.mapping,buf.offset+off)
     return struct.unpack_from('<'+fmt,buf,off)
 
-def digest(buf):
+def digest(buf,check=None):
+    check=checkpoint if check is None else check
     h=hashlib.sha256()
     if isinstance(buf,Region):
         # Views are scoped and explicitly released, including on cancellation.
         # No exported mmap buffers survive this function or an error traceback.
         with memoryview(buf.mapping) as mapped:
             for off in range(0,len(buf),4*1024*1024):
-                checkpoint()
+                check()
                 with mapped[buf.offset+off:buf.offset+min(off+4*1024*1024,len(buf))] as block:
                     h.update(block)
     else:h.update(buf)
     return h.digest()
 
 def block_digests(buf,block_size,padded=False,workers=None):
-    workers=min(4,os.cpu_count() or 1) if workers is None else max(1,workers)
+    workers=min(4,os.cpu_count() or 1) if workers is None else max(1,min(16,workers))
     # Batch adjacent blocks; bound outstanding work and join before mmap closes.
     if isinstance(buf,Region) and workers>1 and len(buf)>=8*1024*1024 and block_size>=2048:
         batch=max(1,(1024*1024)//block_size)*block_size
@@ -89,14 +94,65 @@ def block_digests(buf,block_size,padded=False,workers=None):
             b=bytes(buf[off:off+block_size]);h=hashlib.sha256(b)
             if padded and len(b)<block_size:h.update(bytes(block_size-len(b)))
             yield h.digest()
+def compare_files(originals,packed,expected_for,progress=lambda size:None,workers=None):
+    """Hash bounded batches of mapped files; compare on the caller thread."""
+    import threading
+    from concurrent.futures import TimeoutError
+    workers=min(4,os.cpu_count() or 1) if workers is None else max(1,min(16,workers))
+    require(set(originals)==set(packed),'Packed file list differs from source')
+    stop=threading.Event()
+    def check_worker():
+        if stop.is_set():raise InterruptedError('Verification cancelled.')
+    def run(batch):
+        return [(name,digest(packed[name],check_worker)) for name in batch]
+    def batches():
+        batch=[];size=0
+        for name in originals:
+            checkpoint();n=len(packed[name])
+            if batch and (size+n>4*1024*1024 or len(batch)>=256):
+                yield batch;batch=[];size=0
+            batch.append(name);size+=n
+        if batch:yield batch
+    def accept(results):
+        for name,actual in results:
+            checkpoint()
+            expected=expected_for(originals[name])
+            require(expected is not None and actual==expected,'Packed file differs: '+name)
+            progress(len(packed[name]))
+            yield name,expected
+    if workers==1 or len(originals)<2 or sum(map(len,packed.values()))<8*1024*1024:
+        for name in originals:
+            checkpoint()
+            yield from accept([(name,digest(packed[name]))])
+        return
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        try:
+            pending=iter(batches())
+            while True:
+                group=[]
+                for _ in range(workers*2):
+                    batch=next(pending,None)
+                    if batch is None:break
+                    group.append(pool.submit(run,batch))
+                if not group:break
+                for future in group:
+                    while True:
+                        checkpoint()
+                        try:results=future.result(timeout=0.1);break
+                        except TimeoutError:continue
+                    yield from accept(results)
+        finally:
+            stop.set()
+
 def file_digest(p):
     h=hashlib.sha256()
     with p.open('rb') as f:
-        while b:=f.read(4*1024*1024):h.update(b)
+        while b:=f.read(4*1024*1024):
+            checkpoint();h.update(b)
     return h.digest()
 
 def partition(buf,offset=0):
-    magic,n,stsize,_=u('4sIII',buf,offset);assert magic in (b'PFS0',b'HFS0')
+    magic,n,stsize,_=u('4sIII',buf,offset);require(magic in (b'PFS0',b'HFS0'))
     es=0x40 if magic==b'HFS0' else 0x18;strings=offset+16+n*es;data=strings+stsize
     if data>len(buf):raise ValueError('Partition table out of bounds')
     result={}
@@ -116,72 +172,83 @@ def partition(buf,offset=0):
             name=bytes(buf[start:end]).decode()
         if not name or name in result:raise ValueError('Empty or duplicate partition name')
         if rel>len(buf)-data or size>len(buf)-data-rel:raise ValueError('Partition payload out of bounds')
-        view=buf[data+rel:data+rel+size];assert len(view)==size
+        view=buf[data+rel:data+rel+size];require(len(view)==size)
         if magic==b'HFS0':
             hn,ho=u('IQ',buf,at+20)
             if ho>size or hn>size-ho:raise ValueError('HFS hash range out of bounds')
-            assert digest(view[ho:ho+hn])==bytes(buf[at+32:at+64]),('HFS hash',name)
+            require(digest(view[ho:ho+hn])==bytes(buf[at+32:at+64]),('HFS hash',name))
         result[name]=view
     return result
 
 def nca_sections(buf,verify_payload=True):
-    assert bytes(buf[0x200:0x204])==b'NCA3'
-    assert u('Q',buf,0x208)[0]==len(buf)
+    require(len(buf)>=0xc00 and bytes(buf[0x200:0x204])==b'NCA3')
+    require(u('Q',buf,0x208)[0]==len(buf))
     title=u('Q',buf,0x210)[0];sections=[]
     for i in range(4):
         start,end=u('II',buf,0x240+16*i)
         if not start and not end:continue
         if not (6<=start<end and end*512<=len(buf)):raise ValueError('NCA section out of bounds')
         header=buf[0x400+512*i:0x600+512*i]
-        assert digest(header)==bytes(buf[0x280+32*i:0x2a0+32*i])
-        assert header[4]==1,'Expected plaintext section'
-        body=buf[start*512:end*512];assert len(body)==(end-start)*512
+        require(digest(header)==bytes(buf[0x280+32*i:0x2a0+32*i]))
+        require(header[4]==1,'Expected plaintext section')
+        body=buf[start*512:end*512];require(len(body)==(end-start)*512)
         if header[3]==2:
-            block,count=u('II',header,0x28);assert count==2
+            block,count=u('II',header,0x28);require(count==2)
             ho,hs,do,ds=u('4Q',header,0x30)
             hashes=body[ho:ho+hs];data=body[do:do+ds]
-            assert 0<block<=16*1024*1024 and len(hashes)==hs and len(data)==ds,'PFS section bounds'
+            require(0<block<=16*1024*1024 and len(hashes)==hs and len(data)==ds,'PFS section bounds')
             if verify_payload:
-                assert digest(hashes)==bytes(header[8:40]),'PFS master hash'
+                require(digest(hashes)==bytes(header[8:40]),'PFS master hash')
                 with closing(block_digests(data,block)) as generated:
                     for k,actual in enumerate(generated):
-                        assert actual==bytes(hashes[k*32:k*32+32]),'PFS block hash'
+                        require(actual==bytes(hashes[k*32:k*32+32]),'PFS block hash')
             sections.append(('pfs',data))
         elif header[3]==3:
-            assert bytes(header[8:12])==b'IVFC'
-            count=u('I',header,0x14)[0]-1;assert count==6
+            require(bytes(header[8:12])==b'IVFC')
+            count=u('I',header,0x14)[0]-1;require(count==6)
             expected=header[0xc8:0xe8]
             for j in range(count):
                 off,size,order=u('QQI',header,0x18+j*24)
                 if order>24:raise ValueError('Unsupported IVFC block size')
                 block=1<<order
-                data=body[off:off+size];assert len(data)==size
+                data=body[off:off+size];require(len(data)==size)
                 if verify_payload:
                     with closing(block_digests(data,block,padded=True)) as generated:
                         for k,actual in enumerate(generated):
-                            assert actual==bytes(expected[k*32:k*32+32]),('IVFC',j,k)
+                            require(actual==bytes(expected[k*32:k*32+32]),('IVFC',j,k))
                 expected=data
             sections.append(('romfs',data))
         else:raise ValueError('Unsupported hash')
     return title,buf[0x205],sections
 
-def romfs_files(buf):
-    vals=u('10Q',buf);assert vals[0]==0x50
-    dt=vals[3];ft=vals[7];data=vals[9];result={}
-    def walk(off,parent):
+def romfs_files(buf,validate_name=None):
+    """Bounded RomFS traversal: never follow repeated offsets in imported NSPs."""
+    if validate_name is None:
+        def validate_name(name):
+            require(name not in ('','.','..') and not any(c in name for c in '/\\\0'),'Invalid RomFS filename')
+    vals=u('10Q',buf);require(vals[0]==0x50,'Invalid RomFS header.')
+    dt,ds,ft,fs,data=vals[3],vals[4],vals[7],vals[8],vals[9]
+    require(0x50<=dt<=len(buf) and ds<=len(buf)-dt and ft<=len(buf) and fs<=len(buf)-ft and data<=len(buf),'Invalid RomFS table bounds.')
+    result={};seen_dirs=set();seen_files=set()
+    def visit(off,prefix,depth=0):
+        require(depth<256,'RomFS directory nesting is too deep.')
         while off!=0xffffffff:
-            checkpoint()
-            par,sib,child,first,hashlink,n=u('6I',buf,dt+off)
-            name=bytes(buf[dt+off+24:dt+off+24+n]).decode()
-            prefix=(parent+'/'+name).strip('/')
-            f=first
-            while f!=0xffffffff:
-                fp,fs,fo,size,fh,fn=u('IIQQII',buf,ft+f)
-                fname=bytes(buf[ft+f+32:ft+f+32+fn]).decode()
-                result[(prefix+'/'+fname).strip('/')]=buf[data+fo:data+fo+size]
-                assert len(result[(prefix+'/'+fname).strip('/')])==size
-                f=fs
-            if child!=0xffffffff:walk(child,prefix)
-            off=sib
-    walk(0,'');return result
+            check_cancel=checkpoint;check_cancel()
+            require(off not in seen_dirs and off+24<=ds,'Cyclic or invalid RomFS directory.');seen_dirs.add(off)
+            par,sibling,child,first,hl,n=u('6I',buf,dt+off)
+            require(n<=ds-off-24,'RomFS directory name out of bounds.')
+            name=bytes(buf[dt+off+24:dt+off+24+n]).decode('utf-8')
+            if name:validate_name(name)
+            current=prefix+'/'+name if prefix and name else prefix or name
+            entry=first
+            while entry!=0xffffffff:
+                check_cancel();require(entry not in seen_files and entry+32<=fs,'Cyclic or invalid RomFS file.');seen_files.add(entry)
+                fp,nextfile,fo,size,fh,fn=u('IIQQII',buf,ft+entry)
+                require(fn<=fs-entry-32 and fo<=len(buf)-data and size<=len(buf)-data-fo,'RomFS file out of bounds.')
+                name=bytes(buf[ft+entry+32:ft+entry+32+fn]).decode('utf-8');validate_name(name)
+                path=current+'/'+name if current else name;require(path not in result,'Duplicate RomFS file.')
+                result[path]=buf[data+fo:data+fo+size];entry=nextfile
+            if child!=0xffffffff:visit(child,current,depth+1)
+            off=sibling
+    visit(0,'');return result
 
