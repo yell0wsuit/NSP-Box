@@ -91,6 +91,36 @@ class NupOptimizationTests(unittest.TestCase):
             self.assertEqual(a.files[0][5],1)
             self.assertTrue(a.verify()['verified'])
             self.assertEqual(b''.join(a.file_chunks(0)),data)
+    def test_contiguous_romfs_high_file_count(self):
+        # CI exercises 100k virtual files; set NSP_BOX_STRESS_FILES=400000 locally.
+        import os,time
+        count=int(os.environ.get('NSP_BOX_STRESS_FILES','100000'))
+        npdm=bytearray(256);npdm[:4]=b'META';struct.pack_into('<II',npdm,0x70,0x80,0x80)
+        npdm[0x80:0x84]=b'ACI0';struct.pack_into('<Q',npdm,0x90,TID)
+        files={'exefs/main.npdm':nf.Source.data(bytes(npdm)),'exefs/main':nf.Source.data(b'NSO0'+bytes(256))}
+        files.update((f'romfs/group{i//1000:04d}/file{i:07d}.bin',nf.Source.data(struct.pack('<Q',i)+b'payload')) for i in range(count))
+        archive=self.root/'stress.nup';output=self.root/'stress.nsp'
+        start=time.perf_counter();nf.pack([nf.Package(TID,0,0,files)],archive)
+        packed=time.perf_counter()
+        original_open=Path.open
+        def guarded(path,*args,**kwargs):
+            if any(part.startswith('.nup-nsp-') for part in path.parts) and 'romfs' in path.parts:
+                raise AssertionError('Physical RomFS file opened during contiguous conversion')
+            return original_open(path,*args,**kwargs)
+        with patch.object(Path,'open',guarded):nt.nup_to_nsp(archive,output)
+        converted=time.perf_counter()
+        with nt.nsp_packages(output,deep=False) as packages:
+            actual=packages[0].files
+            self.assertEqual(sum(name.startswith('romfs/') for name in actual),count)
+            for i in (0,count//2,count-1):
+                self.assertEqual(actual[f'romfs/group{i//1000:04d}/file{i:07d}.bin'].read_small(),struct.pack('<Q',i)+b'payload')
+        print(f'High-file-count stress: {count} files; pack {packed-start:.2f}s; convert {converted-packed:.2f}s',flush=True)
+    def test_contiguous_matches_legacy(self):
+        game=snapshot(self.root/'Game',{'z':b'z','a/one':b'a','a/two':b'','日本語/x':b'xyz'})
+        archive=self.root/'fixture.nup';nt.pack_folder(game,archive)
+        a=self.root/'old.nsp';b=self.root/'new.nsp'
+        nt.nup_to_nsp(archive,a,contiguous=False);nt.nup_to_nsp(archive,b)
+        self.assertEqual(a.read_bytes(),b.read_bytes())
     def test_small_snapshot_keeps_base_only_and_discards_old_replacements(self):
         root=self.root/'Bundle';snapshot(root/'base',{'same':b'old','needed':b'keep'})
         snapshot(root/'updates/65536',{'same':b'older update','obsolete':b'old update only'},1)
