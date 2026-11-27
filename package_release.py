@@ -44,7 +44,10 @@ def main():
     parser.add_argument('--executable',type=Path,default=ROOT/'dist'/binary)
     args=parser.parse_args()
     if not re.fullmatch(r'\d+\.\d+\.\d+',engine.VERSION):raise ValueError('Invalid release version')
-    tag='v'+engine.VERSION
+    release_version=os.environ.get('NSP_BOX_RELEASE_VERSION',engine.VERSION)
+    if not re.fullmatch(re.escape(engine.VERSION)+r'(?:-prerelease\+[1-9][0-9]*)?',release_version):
+        raise ValueError('Invalid release version: '+release_version)
+    tag='v'+release_version
     if os.environ.get('GITHUB_REF_TYPE')=='tag' and os.environ.get('GITHUB_REF_NAME')!=tag:
         raise ValueError('Git tag must match engine.VERSION: '+tag)
     files=source_files();out=args.output_dir.resolve();out.mkdir(parents=True,exist_ok=True)
@@ -61,7 +64,7 @@ def main():
         dest.parent.mkdir(parents=True,exist_ok=True);shutil.copy2(path,dest)
     (release/'compatibility').mkdir()
     (release/'compatibility/plaintext-repack.keys').write_text(engine.placeholder_keys(),encoding='utf-8')
-    info={'app_name':'NSP Box','app_version':engine.VERSION,'build_date':datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    info={'app_name':'NSP Box','app_version':engine.VERSION,'release_version':release_version,'build_date':datetime.datetime.now(datetime.timezone.utc).isoformat(),
           'platform':target.replace('-',' '),'python':platform.python_version(),'pillow':version('Pillow'),
           'pyinstaller':version('PyInstaller'),'pyinstaller_hooks':version('pyinstaller-hooks-contrib'),
           'tcl':tkinter.Tcl().eval('info patchlevel'),'openssl':ssl.OPENSSL_VERSION,
@@ -93,7 +96,10 @@ def main():
             if archive.testzip() is not None:raise ValueError('Archive integrity failed: '+p.name)
     sums=''.join(hashlib.sha256(p.read_bytes()).hexdigest()+'  '+p.name+'\n' for p in (portable,source))
     (out/'SHA256SUMS.txt').write_text(sums,encoding='utf-8')
-    (out/'RELEASE_NOTES.md').write_text(notes(),encoding='utf-8')
-    print(json.dumps({'version':engine.VERSION,'portable':portable.name,'source':source.name}))
+    release_notes=notes()
+    if release_version!=engine.VERSION:
+        release_notes='# NSP Box '+release_version+'\n\n'+release_notes.split('\n',1)[1].lstrip('\n')
+    (out/'RELEASE_NOTES.md').write_text(release_notes,encoding='utf-8')
+    print(json.dumps({'version':release_version,'portable':portable.name,'source':source.name}))
 
 if __name__=='__main__':main()
