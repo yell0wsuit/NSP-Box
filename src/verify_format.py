@@ -20,10 +20,15 @@ class Region:
         if not 0<=key<self.size:raise IndexError(key)
         return self.mapping[self.offset+key]
     def __bytes__(self):return self.mapping[self.offset:self.offset+self.size]
-    def read(self,offset,size):return self.mapping[self.offset+offset:self.offset+offset+size]
+    def read(self,offset,size):
+        if not (0<=offset<=self.size and 0<=size<=self.size-offset):raise ValueError('Region read out of bounds')
+        return self.mapping[self.offset+offset:self.offset+offset+size]
 
 def u(fmt,buf,off=0):
-    if isinstance(buf,Region):return struct.unpack('<'+fmt,buf.read(off,struct.calcsize('<'+fmt)))
+    if isinstance(buf,Region):
+        size=struct.calcsize('<'+fmt)
+        if not (0<=off<=len(buf) and size<=len(buf)-off):raise ValueError('Structure exceeds region')
+        return struct.unpack_from('<'+fmt,buf.mapping,buf.offset+off)
     return struct.unpack_from('<'+fmt,buf,off)
 
 def digest(buf):
@@ -64,14 +69,28 @@ def file_digest(p):
 def partition(buf,offset=0):
     magic,n,stsize,_=u('4sIII',buf,offset);assert magic in (b'PFS0',b'HFS0')
     es=0x40 if magic==b'HFS0' else 0x18;strings=offset+16+n*es;data=strings+stsize
+    if data>len(buf):raise ValueError('Partition table out of bounds')
     result={}
     for i in range(n):
         checkpoint()
         at=offset+16+i*es;rel,size,nameoff=u('QQI',buf,at)
-        name=bytes(buf[strings+nameoff:strings+stsize]).split(b'\0')[0].decode()
+        if nameoff>=stsize:raise ValueError('Partition name offset out of bounds')
+        start=strings+nameoff
+        if isinstance(buf,Region):
+            end=buf.mapping.find(b'\0',buf.offset+start,buf.offset+data)
+            if end<0:raise ValueError('Unterminated partition name')
+            name=buf.mapping[buf.offset+start:end].decode()
+        else:
+            end=start
+            while end<data and buf[end]!=0:end+=1
+            if end==data:raise ValueError('Unterminated partition name')
+            name=bytes(buf[start:end]).decode()
+        if not name or name in result:raise ValueError('Empty or duplicate partition name')
+        if rel>len(buf)-data or size>len(buf)-data-rel:raise ValueError('Partition payload out of bounds')
         view=buf[data+rel:data+rel+size];assert len(view)==size
         if magic==b'HFS0':
             hn,ho=u('IQ',buf,at+20)
+            if ho>size or hn>size-ho:raise ValueError('HFS hash range out of bounds')
             assert digest(view[ho:ho+hn])==bytes(buf[at+32:at+64]),('HFS hash',name)
         result[name]=view
     return result
@@ -83,6 +102,7 @@ def nca_sections(buf,verify_payload=True):
     for i in range(4):
         start,end=u('II',buf,0x240+16*i)
         if not start and not end:continue
+        if not (6<=start<end and end*512<=len(buf)):raise ValueError('NCA section out of bounds')
         header=buf[0x400+512*i:0x600+512*i]
         assert digest(header)==bytes(buf[0x280+32*i:0x2a0+32*i])
         assert header[4]==1,'Expected plaintext section'
@@ -91,7 +111,7 @@ def nca_sections(buf,verify_payload=True):
             block,count=u('II',header,0x28);assert count==2
             ho,hs,do,ds=u('4Q',header,0x30)
             hashes=body[ho:ho+hs];data=body[do:do+ds]
-            assert block>0 and len(hashes)==hs and len(data)==ds,'PFS section bounds'
+            assert 0<block<=16*1024*1024 and len(hashes)==hs and len(data)==ds,'PFS section bounds'
             if verify_payload:
                 assert digest(hashes)==bytes(header[8:40]),'PFS master hash'
                 with closing(block_digests(data,block)) as generated:
@@ -103,7 +123,9 @@ def nca_sections(buf,verify_payload=True):
             count=u('I',header,0x14)[0]-1;assert count==6
             expected=header[0xc8:0xe8]
             for j in range(count):
-                off,size,order=u('QQI',header,0x18+j*24);block=1<<order
+                off,size,order=u('QQI',header,0x18+j*24)
+                if order>24:raise ValueError('Unsupported IVFC block size')
+                block=1<<order
                 data=body[off:off+size];assert len(data)==size
                 if verify_payload:
                     with closing(block_digests(data,block,padded=True)) as generated:
