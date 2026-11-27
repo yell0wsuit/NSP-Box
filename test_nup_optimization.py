@@ -52,6 +52,19 @@ class NupOptimizationTests(unittest.TestCase):
             f.seek(offset);f.write(bytes([data[0]^1]))
         with nf.Archive(path) as a:
             with self.assertRaisesRegex(ValueError,'SHA-256 mismatch'):a.verify()
+    def test_parallel_verify_matches_serial_and_detects_corruption(self):
+        data=hashlib.shake_256(b'parallel raw').digest(4*nf.BLOCK+17)
+        path=self.root/'parallel.nup'
+        files={'romfs/raw':nf.Source.data(data),'romfs/compressed':nf.Source.data(b'abc'*2000000),
+               'romfs/duplicate':nf.Source.data(data),'romfs/empty':nf.Source.data(b'')}
+        nf.pack([nf.Package(TID,0,0,files)],path,verify=False)
+        with nf.Archive(path) as a:
+            self.assertEqual(a.verify(workers=1),a.verify(workers=4))
+            offset=next(f[2] for f in a.files if f[0]=='raw')
+        with path.open('r+b') as f:
+            f.seek(offset);f.write(bytes([data[0]^1]))
+        with nf.Archive(path) as a:
+            with self.assertRaisesRegex(ValueError,'SHA-256 mismatch'):a.verify(workers=4)
     def test_small_snapshot_keeps_base_only_and_discards_old_replacements(self):
         root=self.root/'Bundle';snapshot(root/'base',{'same':b'old','needed':b'keep'})
         snapshot(root/'updates/65536',{'same':b'older update','obsolete':b'old update only'},1)

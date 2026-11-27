@@ -8,6 +8,8 @@ from pathlib import Path, PurePosixPath
 from contextlib import contextmanager
 import base64, hashlib, io, json, os, re, shutil, stat, struct, tempfile, unicodedata, uuid, time
 import zstandard as zstd
+from concurrent.futures import ThreadPoolExecutor
+import threading
 
 BLOCK=1024*1024
 LARGE_FILE=256*1024*1024
@@ -382,7 +384,7 @@ class Archive:
             while b:=source.read(min(BLOCK,size-count+1)):
                 check(self.cancel);count+=len(b);require(count<=size,'Decompressed file exceeds its declared size.');h.update(b);yield b
         require(count==size and h.digest()==digest,'File SHA-256 mismatch: '+self.files[index][0])
-    def verify(self,notify=lambda *a:None):
+    def verify(self,notify=lambda *a:None,workers=None):
         """Read each unique extent in physical order using a shared buffer/handle."""
         total=self.stats['uncompressed'];done=0;unique={}
         self.unchanged()
@@ -391,6 +393,57 @@ class Archive:
             key=file[1:]
             if key in unique:unique[key][1]+=file[1]
             else:unique[key]=[i,file[1]]
+        workers=min(4,os.cpu_count() or 1) if workers is None else max(1,workers)
+        ordered=sorted(unique.values(),key=lambda item:self.files[item[0]][2])
+        # Keep tiny files and small archives on the low-overhead sequential path.
+        if workers>1 and len(ordered)>1 and total>=8*BLOCK and sum(self.files[i][1]>=BLOCK for i,_ in ordered)>1:
+            local=threading.local();last=0.0
+            def verify_group(group):
+                if not hasattr(local,'buffer'):
+                    local.buffer=bytearray(BLOCK)
+                    local.decoder=zstd.ZstdDecompressor(max_window_size=MAX_ZSTD_WINDOW)
+                for i,logical_size in group:
+                    check(self.cancel)
+                    name,size,off,stored,expected,codec=self.files[i]
+                    h=hashlib.sha256();count=0
+                    with Slice(self.path,off,stored) as raw:
+                        with (local.decoder.stream_reader(raw,read_across_frames=False,closefd=False) if codec else raw) as reader:
+                            with memoryview(local.buffer) as view:
+                                while True:
+                                    check(self.cancel)
+                                    with view[:min(BLOCK,size-count+1)] as target:
+                                        length=reader.readinto(target)
+                                        if not length:break
+                                        require(length<=size-count,'Decompressed file exceeds its declared size.')
+                                        with target[:length] as chunk:h.update(chunk)
+                                    count+=length
+                    require(count==size and h.digest()==expected,'File SHA-256 mismatch: '+name)
+                return sum(logical_size for _,logical_size in group)
+            def groups():
+                group=[];size=0
+                for item in ordered:
+                    group.append(item);size+=self.files[item[0]][1]
+                    if size>=4*BLOCK or len(group)>=256:
+                        yield group;group=[];size=0
+                if group:yield group
+            pending=iter(groups())
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                while True:
+                    check(self.cancel)
+                    batch=[]
+                    for _ in range(workers*2):
+                        group=next(pending,None)
+                        if group is None:break
+                        batch.append(pool.submit(verify_group,group))
+                    if not batch:break
+                    for future in batch:
+                        done+=future.result()
+                        now=time.monotonic()
+                        if now-last>=0.1:
+                            notify('Verifying NUP files',100*done/max(total,1));last=now
+            self.unchanged();check(self.cancel)
+            notify('Verifying NUP files',100)
+            return dict(self.stats,verified=True)
         buffer=bytearray(BLOCK);last=0.0
         decoder=zstd.ZstdDecompressor(max_window_size=MAX_ZSTD_WINDOW)
         def report():
@@ -399,7 +452,7 @@ class Archive:
             if now-last>=0.1:
                 notify('Verifying NUP files',100*done/max(total,1));last=now
         with memoryview(buffer) as view:
-            for i,logical_size in sorted(unique.values(),key=lambda item:self.files[item[0]][2]):
+            for i,logical_size in ordered:
                 check(self.cancel)
                 name,size,off,stored,expected,codec=self.files[i]
                 h=hashlib.sha256();count=0
