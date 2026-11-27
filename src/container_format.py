@@ -8,6 +8,7 @@ import hashlib, struct, time, threading, stat, os
 from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor
 from collections import deque
+from contextlib import contextmanager
 
 @dataclass(frozen=True)
 class FilePart:
@@ -20,6 +21,16 @@ def configure(cancel=None, progress=None):
     _context.cancel = cancel
     _context.progress = progress
     _context.source_digests = None
+
+@contextmanager
+def isolated_context():
+    """Restore the caller's thread-local builder state even on cancellation."""
+    previous=_context.__dict__.copy()
+    try:
+        yield
+    finally:
+        _context.__dict__.clear()
+        _context.__dict__.update(previous)
 
 def capture_sources(digests):
     _context.source_digests=digests
