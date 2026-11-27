@@ -28,11 +28,30 @@ class NupOptimizationTests(unittest.TestCase):
         with patch.object(nf.zstd,'ZstdCompressor',factory):result=nf.pack([nf.Package(TID,0,0,files)],path)
         self.assertEqual(len(calls),2);self.assertEqual(result['duplicate_files_skipped'],1)
         with nf.Archive(path) as a:
-            called=[];original=a.file_chunks
-            def chunks(index):called.append(index);yield from original(index)
-            with patch.object(a,'file_chunks',chunks):a.verify()
+            called=[];original=nf.Slice
+            def extent(*args,**kwargs):called.append(args[1]);return original(*args,**kwargs)
+            with patch.object(nf,'Slice',extent):a.verify()
             self.assertEqual(len(called),2)
+            self.assertEqual(called,sorted(called))
             self.assertEqual(a.packages[0].files['romfs/c'].read_small(),different)
+    def test_verify_raw_and_empty_extents_with_progress(self):
+        data=hashlib.shake_256(b'raw fixture').digest(2*nf.BLOCK+17)
+        path=self.root/'raw.nup'
+        files={'romfs/raw':nf.Source.data(data),'romfs/empty':nf.Source.data(b'')}
+        nf.pack([nf.Package(TID,0,0,files)],path)
+        with nf.Archive(path) as a:
+            raw=next(f for f in a.files if f[0]=='raw')
+            self.assertEqual(raw[5],0)
+            progress=[]
+            with patch.object(nf,'Slice',side_effect=AssertionError('Raw extent reopened')):
+                self.assertTrue(a.verify(lambda stage,value:progress.append(value))['verified'])
+            self.assertEqual(progress[-1],100)
+            self.assertEqual(progress,sorted(progress))
+            offset=raw[2]
+        with path.open('r+b') as f:
+            f.seek(offset);f.write(bytes([data[0]^1]))
+        with nf.Archive(path) as a:
+            with self.assertRaisesRegex(ValueError,'SHA-256 mismatch'):a.verify()
     def test_small_snapshot_keeps_base_only_and_discards_old_replacements(self):
         root=self.root/'Bundle';snapshot(root/'base',{'same':b'old','needed':b'keep'})
         snapshot(root/'updates/65536',{'same':b'older update','obsolete':b'old update only'},1)
