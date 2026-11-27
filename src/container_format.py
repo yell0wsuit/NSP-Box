@@ -6,6 +6,8 @@ NCA headers and sections are plaintext, with conventional PFS0/SHA256 and RomFS/
 from pathlib import Path
 import hashlib, struct, time, threading, stat, os
 from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
+from collections import deque
 
 @dataclass(frozen=True)
 class FilePart:
@@ -57,6 +59,7 @@ class Blob:
             capture=getattr(_context,'source_digests',None)
             source_hash=hashlib.sha256() if f and capture is not None and source in capture else None
             try:
+                checkpoint()
                 pos = 0
                 while pos < size:
                     n = min(block - len(pending), size - pos)
@@ -65,7 +68,10 @@ class Blob:
                     else: b = source[pos:pos+n]
                     if len(b) != n: raise IOError('Source changed or short read')
                     if source_hash is not None:source_hash.update(b)
-                    pending.extend(b); pos += n
+                    pos += n
+                    if not pending and len(b)==block:
+                        checkpoint();yield b;continue
+                    pending.extend(b)
                     if len(pending) == block:
                         checkpoint()
                         yield bytes(pending); pending.clear()
@@ -75,7 +81,9 @@ class Blob:
         if pending: yield bytes(pending)
 
     def read_head(self, n):
-        return next(self.chunks(n), b'')
+        if n<=0:return b''
+        from contextlib import closing
+        with closing(self.chunks(n)) as chunks:return next(chunks,b'')
 
     def digest(self):
         h = hashlib.sha256()
@@ -174,10 +182,43 @@ def romfs(root, manifest, notify=None):
     header=pack('10Q',0x50,dhpos,len(dhb),dtpos,len(dt),fhpos,len(fhb),ftpos,len(ft),datap)
     return Blob(header,dhb,dt,fhb,ft,datap-ftpos-len(ft),*payload)
 
+def integrity_hashes(blob,block,padded=False,workers=None,report=False):
+    """Read sequentially and hash bounded batches in order."""
+    workers=min(4,os.cpu_count() or 1) if workers is None else max(1,min(8,workers))
+    result=bytearray();done=0;last=0.0
+    def hash_batch(data):
+        hashes=bytearray()
+        with memoryview(data) as view:
+            for off in range(0,len(data),block):
+                with view[off:off+block] as part:
+                    h=hashlib.sha256(part)
+                    if padded and len(part)<block:h.update(bytes(block-len(part)))
+                hashes.extend(h.digest())
+        return hashes
+    def accept(data,size):
+        nonlocal done,last
+        result.extend(data);done+=size;checkpoint()
+        now=time.monotonic()
+        if report and now-last>=0.15:progress(done,blob.size);last=now
+    batch=max(1,(1024*1024)//block)*block
+    if workers==1 or blob.size<8*1024*1024:
+        for data in blob.chunks(batch):accept(hash_batch(data),len(data))
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            pending=deque()
+            for data in blob.chunks(batch):
+                checkpoint();pending.append((pool.submit(hash_batch,data),len(data)))
+                if len(pending)>=workers*2:
+                    future,size=pending.popleft();accept(future.result(),size)
+            while pending:
+                future,size=pending.popleft();accept(future.result(),size)
+    if report:progress(done,blob.size)
+    return bytes(result)
+
 def pfs_section(blob):
     block=0x10000
     while blob.size > block * block // 32: block *= 2
-    hashes=b''.join(sha(b) for b in blob.chunks(block))
+    hashes=integrity_hashes(blob,block)
     data_off=align(len(hashes),0x200)
     header=bytearray(0x200);struct.pack_into('<HBBB',header,0,2,1,2,1)
     header[8:40]=sha(hashes)
@@ -188,12 +229,7 @@ def romfs_section(blob):
     block=0x4000
     levels=[blob]
     for layer in range(5):
-        digests=[];done=0;last=0
-        for b in levels[0].chunks(block):
-            digests.append(sha(b+bytes(block-len(b))));done+=len(b)
-            if layer == 0 and time.monotonic()-last>0.15:
-                progress(done,levels[0].size);last=time.monotonic()
-        hashes=b''.join(digests)
+        hashes=integrity_hashes(levels[0],block,padded=True,report=layer==0)
         levels.insert(0,Blob(hashes))
     master=sha(levels[0].read_head(block).ljust(block,b'\0'))
     header=bytearray(0x200);struct.pack_into('<HBBB',header,0,2,0,3,1)
