@@ -164,6 +164,8 @@ class NupOptimizationTests(unittest.TestCase):
             if stage=='Indexing RomFS files':event.set()
         with self.assertRaises(InterruptedError):nt.nup_to_nsp(archive,cancelled,staging_dir=staging,cancel=event,notify=stop)
         self.assertFalse(cancelled.exists());self.assertEqual(list(staging.iterdir()),[])
+        # A cancelled conversion must not poison later builder operations on this thread.
+        self.assertEqual(fmt.Blob(b'fresh').read_head(5),b'fresh')
         with self.assertRaisesRegex(ValueError,'existing temporary'):nt.nup_to_nsp(archive,self.root/'invalid.nsp',staging_dir=self.root/'missing')
     def test_contiguous_matches_legacy(self):
         game=snapshot(self.root/'Game',{'z':b'z','a/one':b'a','a/two':b'','日本語/x':b'xyz'})

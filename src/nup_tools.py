@@ -328,6 +328,7 @@ def compact_packages(packages):
     merged=merge_game(packages)
     return [merged]+[p for p in packages if p.kind not in (0,1)]
 
+@fmt.isolated_context()
 def build_snapshot_nsp(package,output,verify=True,notify=lambda *a:None,cancel=None,contiguous=True,staging_dir=None):
     """Rebuild a snapshot, honoring explicit presentation metadata overrides."""
     output=Path(output);require(not output.exists(),'NSP output already exists.')
