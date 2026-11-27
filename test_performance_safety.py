@@ -41,6 +41,15 @@ class VerificationSafetyTests(unittest.TestCase):
             if stage=='Verifying container integrity':(self.game/'romfs/data.bin').write_bytes(b'changed')
         with self.assertRaisesRegex(ValueError,'changed'):engine.build(self.snapshot,self.out,'Example','1',notify=notify)
         self.assertFalse(self.out.exists())
+    def test_parallel_integrity_generation(self):
+        import hashlib
+        data=b'abcdefgh'*(1200000)+b'tail'
+        for block in (16384,65536):
+            for padded in (False,True):
+                expected=b''.join(hashlib.sha256(data[i:i+block].ljust(block,b'\0') if padded else data[i:i+block]).digest()
+                                  for i in range(0,len(data),block))
+                for workers in (1,4):
+                    self.assertEqual(fmt.integrity_hashes(fmt.Blob(data),block,padded,workers),expected)
     def test_parallel_block_hashes_match_serial(self):
         path=self.root/'blocks.bin';path.write_bytes(b'abcdefgh'*(1024*1024)+b'tail')
         with path.open('rb') as f,mmap.mmap(f.fileno(),0,access=mmap.ACCESS_READ) as mm:

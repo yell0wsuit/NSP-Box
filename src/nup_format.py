@@ -163,7 +163,7 @@ def write_extent(out,source,stream,first,level,large_raw,cancel,on_read,known_di
         stored=source.size;codec=False
     return stored,digest,int(codec)
 
-def pack(packages,output,level=3,large_raw=True,verify=True,notify=lambda *a:None,cancel=None,source_guard=None):
+def pack(packages,output,level=3,large_raw=True,verify=True,notify=lambda *a:None,cancel=None,source_guard=None,workers=None):
     """Stream files once; re-read only when compression does not save space."""
     validate_packages(packages);require(level in (1,3,9),'Choose compression level 1, 3 or 9.')
     output=Path(output).absolute();require(output.suffix.lower()=='.nup','Output must end in .nup.')
@@ -206,7 +206,41 @@ def pack(packages,output,level=3,large_raw=True,verify=True,notify=lambda *a:Non
     try:
         with temp.open('xb+') as out:
             out.write(bytes(bloboff))
-            for node in files:
+            workers=min(4,os.cpu_count() or 1) if workers is None else max(1,min(8,workers))
+            # Bounded small-file batches: read once, deduplicate before compression,
+            # compress independent unique payloads, commit in original table order.
+            def compress_small(data):
+                check(cancel)
+                if not data:return data,0
+                try:
+                    encoded=zstd.ZstdCompressor(level=level,write_content_size=True).compress(data)
+                except zstd.ZstdError:return data,0
+                return (encoded,1) if len(encoded)<len(data) else (data,0)
+            def small_batch(batch,pool):
+                nonlocal done,duplicate_files
+                pending={};items=[]
+                for node in batch:
+                    check(cancel);source=node[1];source.validate()
+                    with source.opener() as stream:data=stream.read(source.size+1)
+                    require(len(data)==source.size,'Source size changed during packaging.')
+                    source.validate();digest=hashlib.sha256(data).digest();key=(digest,source.size)
+                    prefixes.add((source.size,hashlib.sha256(data[:65536]).digest()))
+                    if source.size and key not in seen and key not in pending:
+                        pending[key]=pool.submit(compress_small,data)
+                    items.append((node,key))
+                for node,key in items:
+                    check(cancel);digest,size=key
+                    if not size:node[2:]=[0,0,digest,0]
+                    elif key in seen:
+                        off,stored,codec=seen[key];node[2:]=[off,stored,digest,codec];duplicate_files+=1
+                    else:
+                        encoded,codec=pending.pop(key).result()
+                        start=align(out.tell());out.write(bytes(start-out.tell()));out.write(encoded)
+                        node[2:]=[start,len(encoded),digest,codec];seen[key]=(start,len(encoded),codec)
+                    done+=size
+                notify('Compressing / storing files',3+76*done/max(total,1))
+            def stream_node(node):
+                nonlocal done,duplicate_files
                 check(cancel);source=node[1];source.validate()
                 def on_read(count):notify('Compressing / storing files',3+76*(done+count)/max(total,1))
                 with dedup_stream(source,prefixes,seen,cancel,on_read) as (stream,first,known,extent):
@@ -218,6 +252,18 @@ def pack(packages,output,level=3,large_raw=True,verify=True,notify=lambda *a:Non
                         if source.size==0:node[2:]=[0,0,digest,0]
                         else:node[2:]=[start,stored,digest,codec];seen[(digest,source.size)]=(start,stored,codec)
                 done+=source.size
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                batch=[];batch_size=0
+                for node in files:
+                    check(cancel);size=node[1].size
+                    if workers==1 or size>8*BLOCK:
+                        if batch:small_batch(batch,pool);batch=[];batch_size=0
+                        stream_node(node)
+                    else:
+                        if batch and (batch_size+size>32*BLOCK or len(batch)>=256):
+                            small_batch(batch,pool);batch=[];batch_size=0
+                        batch.append(node);batch_size+=size
+                if batch:small_batch(batch,pool)
             meta=[]
             for p in packages:
                 data=tlv_bytes(p.metadata);require(len(data)<=32*1024*1024,'Package metadata exceeds 32 MiB.')
@@ -500,7 +546,7 @@ def package_path(p):
     if p.kind==2:return f'dlc/{p.title_id:016X}/{p.version}'
     return f'{KINDS[p.kind]}/{p.title_id:016X}/{p.version}'
 
-def extract(path,output,selection=None,notify=lambda *a:None,cancel=None):
+def extract(path,output,selection=None,notify=lambda *a:None,cancel=None,workers=None):
     output=Path(output).absolute();require(not output.exists(),'Extract into a new folder; existing files are never overwritten.')
     output.parent.mkdir(parents=True,exist_ok=True)
     stage=Path(tempfile.mkdtemp(prefix='.nup-extract-',dir=output.parent))
@@ -520,10 +566,26 @@ def extract(path,output,selection=None,notify=lambda *a:None,cancel=None):
                     key=item.casefold() if os.name=='nt' else item
                     require(key not in collision,'Case-colliding names cannot be extracted on this filesystem.');collision.add(key)
                 for directory in sorted(p.directories):check(cancel);(base/directory).mkdir(parents=True,exist_ok=True)
-                for item,index in archive.trees[k].items():
+                count=min(4,os.cpu_count() or 1) if workers is None else max(1,min(8,workers))
+                if archive.max_frame_window:count=min(count,max(1,(256*BLOCK)//archive.max_frame_window))
+                def extract_one(entry):
+                    item,index=entry;check(cancel)
                     target=base/item;target.parent.mkdir(parents=True,exist_ok=True)
                     with target.open('xb') as f:
-                        for b in archive.file_chunks(index):f.write(b);done+=len(b);notify('Extracting verified files',99*done/max(total,1))
+                        for chunk in archive.file_chunks(index):f.write(chunk)
+                    return archive.files[index][1]
+                entries=iter(archive.trees[k].items())
+                with ThreadPoolExecutor(max_workers=count) as pool:
+                    while True:
+                        check(cancel);batch=[]
+                        for _ in range(count*2):
+                            entry=next(entries,None)
+                            if entry is None:break
+                            batch.append(pool.submit(extract_one,entry))
+                        if not batch:break
+                        for future in batch:
+                            done+=future.result()
+                            notify('Extracting verified files',99*done/max(total,1))
                 manifest.append({'path':relative,'title_id':f'{p.title_id:016X}','version':p.version,'kind':p.kind,'flags':p.flags,
                                  'metadata':[[t,base64.b64encode(d).decode('ascii')] for t,d in p.metadata]})
             archive.unchanged()

@@ -2,6 +2,7 @@
 from pathlib import Path
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
+import time
 import base64, hashlib, io, json, mmap, os, re, shutil, struct, tempfile, uuid, stat
 import engine, container_format as fmt, verify_format as vf
 from nup_format import (Package, Source, Archive, PRESETS, KINDS, check, require,
@@ -332,14 +333,20 @@ def build_snapshot_nsp(package,output,verify=True,notify=lambda *a:None,cancel=N
     output=Path(output);require(not output.exists(),'NSP output already exists.')
     fmt.configure(cancel,lambda done,total:notify('Building NSP integrity trees',20+35*done/max(total,1)))
     with tempfile.TemporaryDirectory(prefix='.nup-nsp-',dir=output.parent) as work:
-        root=Path(work);total=sum(s.size for s in package.files.values());done=0
+        root=Path(work);total=sum(s.size for s in package.files.values());done=0;expected_hashes={};last=0.0
         for name,source in package.files.items():
             if not name.startswith(('exefs/','romfs/','data/control/','control/')) and name!='control.nacp':continue
             target=root.joinpath(*path_parts(name));target.parent.mkdir(parents=True,exist_ok=True)
             with source.opener() as f,target.open('xb') as out:
-                count=0
-                while b:=f.read(1024*1024):check(cancel);out.write(b);count+=len(b);done+=len(b);require(count<=source.size,'Source size changed.');notify('Preparing snapshot',20*done/max(total,1))
+                count=0;h=hashlib.sha256()
+                while b:=f.read(1024*1024):
+                    check(cancel);out.write(b);count+=len(b);done+=len(b)
+                    require(count<=source.size,'Source size changed.')
+                    if verify:h.update(b)
+                    now=time.monotonic()
+                    if now-last>=0.1:notify('Preparing snapshot',20*done/max(total,1));last=now
             require(count==source.size,'Incomplete snapshot file.');source.validate()
+            if verify:expected_hashes[name]=h.digest()
         if package.kind==2:
             import dlc
             return dlc.build(dlc.DlcSnapshot(root,package.title_id,package.version,'NUP DLC'),output,verify_output=verify,notify=notify,cancel=cancel)
@@ -366,8 +373,12 @@ def build_snapshot_nsp(package,output,verify=True,notify=lambda *a:None,cancel=N
         icon=next((d for t,d in package.metadata if t==3),None)
         if icon is not None:(control/'icon_AmericanEnglish.dat').write_bytes(icon)
         expected_files=dict(package.files)
-        if original is not None:expected_files['data/control/control.nacp']=Source.data(original)
-        if icon is not None:expected_files['data/control/icon_AmericanEnglish.dat']=Source.data(icon)
+        if original is not None:
+            expected_files['data/control/control.nacp']=Source.data(original)
+            expected_hashes['data/control/control.nacp']=hashlib.sha256(original).digest()
+        if icon is not None:
+            expected_files['data/control/icon_AmericanEnglish.dat']=Source.data(icon)
+            expected_hashes['data/control/icon_AmericanEnglish.dat']=hashlib.sha256(icon).digest()
         exefs=root/'exefs';romfs=root/'romfs'
         require(exefs.is_dir() and romfs.is_dir(),'Missing complete ExeFS/RomFS snapshot.')
         require(all(p.is_file() for p in exefs.iterdir()),'Nested ExeFS directories are unsupported by NSP.')
@@ -397,7 +408,7 @@ def build_snapshot_nsp(package,output,verify=True,notify=lambda *a:None,cancel=N
                             with s.opener() as f:
                                 while b:=f.read(1024*1024):check(cancel);h.update(b)
                             return h.digest()
-                        require(source.size==actual.files[name].size and digest(source)==digest(actual.files[name]),'NSP reconstruction changed expected file: '+name)
+                        require(source.size==actual.files[name].size and expected_hashes[name]==digest(actual.files[name]),'NSP reconstruction changed expected file: '+name)
             check(cancel);commit_file(temp,output)
             return {'output':str(output),'size':blob.size,'verified':verify}
         finally:
