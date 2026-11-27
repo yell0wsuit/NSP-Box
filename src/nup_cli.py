@@ -13,6 +13,7 @@ def main(argv):
     parser.add_argument('--latest-snapshot',action=argparse.BooleanOptionalAction,default=True,help='Folder packing: keep one latest game snapshot; --no-latest-snapshot archives all game versions.')
     parser.add_argument('--verify',action=argparse.BooleanOptionalAction,default=True)
     parser.add_argument('--staging-dir',type=Path,help='Existing temporary storage folder for NUP-to-NSP (default: beside output).')
+    parser.add_argument('--progress',action='store_true',help='Print conversion stage throughput and ETA to stderr.')
     parser.add_argument('--package-index',type=int);parser.add_argument('--result-json',type=Path)
     args=parser.parse_args(argv)
     try:
@@ -24,7 +25,12 @@ def main(argv):
             extra={'latest_snapshot':args.latest_snapshot} if op=='pack' else {}
             result=fn(args.input,args.output,level=PRESETS[args.preset],large_raw=args.large_files_raw,verify=args.verify,**extra)
         elif op=='extract':result=tools.extract(args.input,args.output,selection=None if args.package_index is None else [args.package_index])
-        elif op=='nup-to-nsp':result=tools.nup_to_nsp(args.input,args.output,selection=args.package_index,verify=args.verify,staging_dir=args.staging_dir)
+        elif op=='nup-to-nsp':
+            def metrics(stage,done,total,rate,eta,files):
+                speed='--' if rate is None else f'{rate/1024**2:.1f} MiB/s'
+                remaining='--' if eta is None else f'{eta:.0f}s'
+                if sys.stderr:print(f'{stage}: {done}/{total} bytes, {speed}, stage ETA {remaining}',file=sys.stderr,flush=True)
+            result=tools.nup_to_nsp(args.input,args.output,selection=args.package_index,verify=args.verify,staging_dir=args.staging_dir,metrics=metrics if args.progress else None)
         else:result=tools.inspect(args.input,verify=op=='verify')
         code=0
     except Exception as error:result={'error':str(error)};code=1

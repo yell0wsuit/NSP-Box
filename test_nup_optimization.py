@@ -12,6 +12,25 @@ class NupOptimizationTests(unittest.TestCase):
         scratch=Path(__file__).parent/'test-work';scratch.mkdir(exist_ok=True)
         self.tmp=tempfile.TemporaryDirectory(dir=scratch);self.root=Path(self.tmp.name)
     def tearDown(self):self.tmp.cleanup()
+    def test_bounded_read_ahead_and_random_seek(self):
+        class Count(io.BytesIO):
+            def __init__(self,data):super().__init__(data);self.reads=[]
+            def read(self,n=-1):self.reads.append(n);return super().read(n)
+        data=bytes(range(256))*4096;raw=Count(data);reader=nf.ReadAhead(raw,4096)
+        for offset in range(0,1024,16):
+            reader.seek(offset);self.assertEqual(reader.read(16),data[offset:offset+16])
+        self.assertLess(len(raw.reads),5)
+        reader.seek(900000);self.assertEqual(reader.read(16),data[900000:900016]);self.assertEqual(raw.reads[-1],16)
+        self.assertLessEqual(max(raw.reads),4096)
+    def test_stage_rate_resets_and_eta(self):
+        events=[];now=[0.]
+        rate=nt.StageRate(lambda *a:events.append(a),lambda:now[0])
+        rate.update('stage',0,100);now[0]=2;rate.update('stage',50,100)
+        self.assertEqual(events[-1][3:5],(25.,2.))
+        now[0]=3;rate.update('next',0,100)
+        self.assertEqual(events[-1][3:5],(None,None))
+        now[0]=4;rate.update('next',100,100)
+        self.assertEqual(events[-1][4],0.)
     def test_decoder_accepts_writer_frames_above_old_1mib_cap(self):
         data=b'abcde'*2000000;path=self.root/'window.nup'
         nf.pack([nf.Package(TID,0,0,{'romfs/data':nf.Source.data(data)})],path)
@@ -156,7 +175,10 @@ class NupOptimizationTests(unittest.TestCase):
         output=self.root/'custom.nsp';seen=[]
         def notify(stage,value):
             if list(staging.glob('.nup-nsp-*')):seen.append(stage)
-        nt.nup_to_nsp(archive,output,staging_dir=staging,notify=notify)
+        metrics=[]
+        nt.nup_to_nsp(archive,output,staging_dir=staging,notify=notify,metrics=lambda *a:metrics.append(a))
+        self.assertTrue(any(m[0]=='Staging contiguous RomFS' and m[1]==m[2] for m in metrics))
+        self.assertTrue(any(m[0]=='Writing reconstructed NSP' and m[1]==m[2] for m in metrics))
         self.assertTrue(seen);self.assertEqual(baseline.read_bytes(),output.read_bytes())
         self.assertEqual(list(staging.iterdir()),[])
         cancelled=self.root/'cancelled.nsp';event=threading.Event()

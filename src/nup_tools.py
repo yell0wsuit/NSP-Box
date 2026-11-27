@@ -328,15 +328,36 @@ def compact_packages(packages):
     merged=merge_game(packages)
     return [merged]+[p for p in packages if p.kind not in (0,1)]
 
+class StageRate:
+    """Estimate only the active byte-counted stage, never weighted overall progress."""
+    def __init__(self,callback=None,clock=time.monotonic):
+        self.callback=callback;self.clock=clock;self.stage=None;self.start=0;self.last=0;self.done=0;self.rate=None
+    def update(self,stage,done,total,files=None):
+        if self.callback is None:return
+        now=self.clock()
+        if stage!=self.stage or done<self.done:
+            self.stage=stage;self.start=now;self.last=now;self.done=done;self.rate=None
+            self.callback(stage,done,total,None,None,files);return
+        elapsed=now-self.last
+        if elapsed<0.5 and done<total:return
+        if elapsed>0:
+            current=(done-self.done)/elapsed
+            self.rate=current if self.rate is None else .3*current+.7*self.rate
+        self.last=now;self.done=done
+        rate=self.rate if self.rate and self.rate>0 else None
+        self.callback(stage,done,total,rate,max(0,total-done)/rate if rate else None,files)
+
 @fmt.isolated_context()
-def build_snapshot_nsp(package,output,verify=True,notify=lambda *a:None,cancel=None,contiguous=True,staging_dir=None):
+def build_snapshot_nsp(package,output,verify=True,notify=lambda *a:None,cancel=None,contiguous=True,staging_dir=None,metrics=None):
     """Rebuild a snapshot, honoring explicit presentation metadata overrides."""
     output=Path(output);require(not output.exists(),'NSP output already exists.')
     phase=[20,45,'Building NSP integrity trees'];last_progress=20
+    meter=StageRate(metrics)
     def report(done,total):
         nonlocal last_progress
         last_progress=max(last_progress,phase[0]+(phase[1]-phase[0])*done/max(total,1))
         notify(phase[2],last_progress)
+        meter.update(phase[2],done,total)
     fmt.configure(cancel,report)
     with tempfile.TemporaryDirectory(prefix='.nup-nsp-',dir=output.parent if staging_dir is None else staging_dir) as work:
         root=Path(work);total=sum(s.size for s in package.files.values());done=0;expected_hashes={};last=0.0
@@ -359,20 +380,22 @@ def build_snapshot_nsp(package,output,verify=True,notify=lambda *a:None,cancel=N
         if indexed:
             from contextlib import ExitStack
             import zstandard as zstd
-            from nup_format import MAX_ZSTD_WINDOW
+            from nup_format import MAX_ZSTD_WINDOW,ReadAhead
             notify('Indexing RomFS files',20)
             with ExitStack() as stack:
                 handles={};decoder=zstd.ZstdDecompressor(max_window_size=MAX_ZSTD_WINDOW)
-                hashes_by_source={}
+                hashes_by_source={};staged=0;staged_files=0;rom_total=sum(s.size for s in rom_sources.values())
+                meter.update('Staging contiguous RomFS',0,rom_total,0)
                 def write_source(source,out):
-                    nonlocal done,last
+                    nonlocal done,last,staged,staged_files
                     check(cancel);count=0
                     if source.archive_entry is not None:
                         archive,index=source.archive_entry
                         if archive not in handles:
-                            archive.unchanged();handles[archive]=stack.enter_context(archive.path.open('rb'))
+                            archive.unchanged();handles[archive]=ReadAhead(stack.enter_context(archive.path.open('rb')))
                         for chunk in archive.file_chunks(index,handles[archive],decoder):
-                            out.write(chunk);count+=len(chunk)
+                            out.write(chunk);count+=len(chunk);staged+=len(chunk)
+                            if metrics is not None:meter.update('Staging contiguous RomFS',staged,rom_total,staged_files)
                         digest=archive.files[index][4]
                     else:
                         source.validate();h=hashlib.sha256()
@@ -380,13 +403,15 @@ def build_snapshot_nsp(package,output,verify=True,notify=lambda *a:None,cancel=N
                             while chunk:=stream.read(1024*1024):
                                 check(cancel);count+=len(chunk)
                                 require(count<=source.size,'Source size changed.')
-                                out.write(chunk);h.update(chunk)
+                                out.write(chunk);h.update(chunk);staged+=len(chunk)
+                                if metrics is not None:meter.update('Staging contiguous RomFS',staged,rom_total,staged_files)
                         source.validate();digest=h.digest()
                     require(count==source.size,'Incomplete snapshot file.')
                     if verify:hashes_by_source[id(source)]=digest
-                    done+=count;now=time.monotonic()
+                    staged_files+=1;done+=count;now=time.monotonic()
                     if now-last>=0.1:notify('Staging contiguous RomFS',20+10*done/max(total,1));last=now
                 rblob=fmt.romfs_indexed(rom_sources,root/'romfs.payload',write_source)
+                meter.update('Staging contiguous RomFS',staged,rom_total,staged_files)
                 for archive in handles:archive.unchanged()
                 if verify:expected_hashes.update(('romfs/'+name,hashes_by_source[id(source)]) for name,source in rom_sources.items())
             phase[:]=[30,50,'Building NSP integrity trees'];last_progress=30
@@ -448,9 +473,10 @@ def build_snapshot_nsp(package,output,verify=True,notify=lambda *a:None,cancel=N
         temp=output.with_name(output.name+'.'+uuid.uuid4().hex[:10]+'.partial')
         try:
             with temp.open('xb') as out:
-                done=0;last=0.0
+                done=0;last=0.0;meter.update('Writing reconstructed NSP',0,blob.size)
                 for b in blob.chunks(4*1024*1024):
                     check(cancel);out.write(b);done+=len(b)
+                    meter.update('Writing reconstructed NSP',done,blob.size)
                     now=time.monotonic()
                     if now-last>=0.1:notify('Writing reconstructed NSP',60+25*done/blob.size);last=now
                 notify('Writing reconstructed NSP',85)
@@ -473,7 +499,7 @@ def build_snapshot_nsp(package,output,verify=True,notify=lambda *a:None,cancel=N
         finally:
             if temp.exists():temp.unlink()
 
-def nup_to_nsp(path,output,selection=None,verify=True,notify=lambda *a:None,cancel=None,include_kinds=None,contiguous=True,staging_dir=None):
+def nup_to_nsp(path,output,selection=None,verify=True,notify=lambda *a:None,cancel=None,include_kinds=None,contiguous=True,staging_dir=None,metrics=None):
     """Whole archive -> game+highest update and separate DLC NSPs, or one package."""
     output=Path(output).absolute();require(not output.exists(),'Output already exists; choose a new path.')
     output.parent.mkdir(parents=True,exist_ok=True)
@@ -511,13 +537,13 @@ def nup_to_nsp(path,output,selection=None,verify=True,notify=lambda *a:None,canc
         require(len(packages)==1 or output.suffix.lower()!='.nsp','A game plus DLC needs a new output folder, not one .nsp filename.')
         single=output.suffix.lower()=='.nsp'
         if single:
-            result=build_snapshot_nsp(packages[0],output,verify,lambda s,v:notify(s,10+89*v/100),cancel,contiguous,staging);archive.unchanged();notify('NSP ready',100);return result
+            result=build_snapshot_nsp(packages[0],output,verify,lambda s,v:notify(s,10+89*v/100),cancel,contiguous,staging,metrics);archive.unchanged();notify('NSP ready',100);return result
         stage=Path(tempfile.mkdtemp(prefix='.nup-convert-',dir=output.parent))
         try:
             results=[]
             for i,p in enumerate(packages):
                 check(cancel);name=f'{"DLC" if p.kind==2 else "Game"} [{p.title_id:016X}] v{p.version}.nsp'
-                result=build_snapshot_nsp(p,stage/name,verify,lambda s,v:notify(s,10+89*(i+v/100)/len(packages)),cancel,contiguous,staging);results.append(result)
+                result=build_snapshot_nsp(p,stage/name,verify,lambda s,v:notify(s,10+89*(i+v/100)/len(packages)),cancel,contiguous,staging,metrics);results.append(result)
             archive.unchanged();check(cancel);stage.rename(output);notify('NSP conversion complete',100)
             return {'output':str(output),'size':sum(r['size'] for r in results),'verified':verify,'packages':len(results)}
         finally:

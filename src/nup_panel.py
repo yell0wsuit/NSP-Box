@@ -24,6 +24,14 @@ def automatic_output(path,operation):
         candidate=source.parent/(f'{stem} ({number})'+suffix);number+=1
     return str(candidate)
 
+def format_stage_metrics(done,total,rate,eta,files=None):
+    text=f' · {done/1024**2:,.0f}/{total/1024**2:,.0f} MiB'
+    if files is not None:text+=f' · {files:,} files'
+    if rate is not None:text+=f' · {rate/1024**2:.1f} MiB/s'
+    if eta is not None:
+        seconds=int(eta+0.5);text+=f' · stage ETA {seconds//3600:d}:{seconds//60%60:02d}:{seconds%60:02d}'
+    return text
+
 class NupPanel(AmbientFrame):
     def __init__(self,parent):
         super().__init__(parent,bg=BG);self.app=parent;self.motion=parent.motion
@@ -236,10 +244,13 @@ class NupPanel(AmbientFrame):
         for c in self.controls+[self.start_button]:c.configure(state='disabled' if value else 'normal')
         self.cancel_button.configure(state='normal' if value else 'disabled');self.update_controls()
     def worker(self,call,kind):
-        self.set_busy(True);self.cancel_event.clear();self.progress['value']=0;self.last_progress=0;last=[0]
+        self.set_busy(True);self.cancel_event.clear();self.progress['value']=0;self.last_progress=0;self.rate_stage=None;self.rate_text='';last=[0]
         def notify(stage,value):
             now=time.monotonic()
             if now-last[0]>.1 or value>=100:self.events.put(('progress',(stage,value)));last[0]=now
+        def metrics(stage,done,total,rate,eta,files):
+            self.events.put(('metrics',(stage,done,total,rate,eta,files)))
+        notify.metrics=metrics
         def run():
             try:self.events.put((kind,call(notify)))
             except InterruptedError:self.events.put(('cancelled',None))
@@ -278,7 +289,7 @@ class NupPanel(AmbientFrame):
             if op==OPERATIONS[2]:
                 with Archive(path,self.cancel_event) as archive:selection=[i for i,p in enumerate(archive.packages) if p.kind in kinds]
                 return tools.extract(path,output,selection=selection,**common)
-            if op==OPERATIONS[3]:return tools.nup_to_nsp(path,output,include_kinds=kinds,verify=verify,staging_dir=staging,**common)
+            if op==OPERATIONS[3]:return tools.nup_to_nsp(path,output,include_kinds=kinds,verify=verify,staging_dir=staging,metrics=notify.metrics,**common)
             return tools.inspect(path,verify=verify,**common)
         self.worker(call,'done')
     def show_report(self,data):
@@ -301,7 +312,13 @@ class NupPanel(AmbientFrame):
                 kind,data=self.events.get_nowait()
                 if kind=='progress':
                     stage,value=data;self.last_progress=max(self.last_progress,value);self.progress['value']=self.last_progress
-                    if not self.cancel_event.is_set():self.status.set(f'{stage} · {value:.0f}%')
+                    if not self.cancel_event.is_set():
+                        self.status.set(f'{stage} · {value:.0f}%'+(self.rate_text if self.rate_stage==stage else ''))
+                elif kind=='metrics':
+                    stage,done,total,rate,eta,files=data
+                    self.rate_stage=stage;self.rate_text=format_stage_metrics(done,total,rate,eta,files)
+                    if not self.cancel_event.is_set() and self.status.get().startswith(stage+' ·'):
+                        self.status.set(f'{stage} · {self.last_progress:.0f}%'+self.rate_text)
                 elif kind in ('done','scan'):
                     self.set_busy(False)
                     if kind=='scan' and data['_source_key']!=self.source_key():
