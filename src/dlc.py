@@ -169,9 +169,8 @@ def verify(path, snapshot, sources, notify=lambda *a: None, captured=None):
         for name, data in files.items():
             fmt.checkpoint()
             reader.require(data[0x204] == distribution, 'NCA distribution type')
-            hashes[name] = reader.digest(data)
+            hashes[name], (tid, kind, sections) = reader.verified_nca(data)
             reader.require(hashes[name][:16].hex() == name[:32], 'NCA content ID')
-            tid, kind, sections = reader.nca_sections(data)
             reader.require(tid == snapshot.title_id, 'DLC title ID')
             reader.require(kind not in parsed, 'Duplicate content type')
             parsed[kind] = sections

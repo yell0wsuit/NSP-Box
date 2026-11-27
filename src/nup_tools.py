@@ -210,10 +210,6 @@ def nsp_packages(path,cancel=None,notify=lambda *a:None,deep=True):
             for name,region in ncas.items():
                 check(cancel);require(len(region)>=0xc00 and bytes(region[0x200:0x204])==b'NCA3' and region[0x204]==0,'Only plaintext NSP-Box NSPs are supported; encrypted/retail content is not supported.')
                 require(re.fullmatch(r'[0-9a-f]{32}(?:\.cnmt)?\.nca',name) is not None,'Unsupported NCA filename.')
-                if deep:
-                    notify('Checking source NCA integrity',1)
-                    digest=vf.digest(region);require(name[:32]==digest[:16].hex(),'NCA content hash does not match its name.')
-                else:digest=None
                 for i in range(4):
                     start,end=vf.u('II',region,0x240+i*16)
                     if not start and not end:continue
@@ -223,7 +219,13 @@ def nsp_packages(path,cancel=None,notify=lambda *a:None,deep=True):
                         block=vf.u('I',header,0x28)[0];require(0<block<=16*1024*1024,'Unsupported NCA integrity block size.')
                     elif header[3]==3:
                         for j in range(6):require(vf.u('I',header,0x18+j*24+16)[0]<=24,'Unsupported IVFC block size.')
-                parsed[name]=vf.nca_sections(region,verify_payload=deep);hashes[name]=digest
+                if deep:
+                    notify('Checking source NCA integrity',1)
+                    digest,parsed[name]=vf.verified_nca(region)
+                    require(name[:32]==digest[:16].hex(),'NCA content hash does not match its name.')
+                else:
+                    digest=None;parsed[name]=vf.nca_sections(region,verify_payload=False)
+                hashes[name]=digest
             metas=[(n,v) for n,v in parsed.items() if v[1]==1];require(metas,'NSP has no title metadata.')
             packages=[];claimed=set()
             for metaname,(_,_,sections) in metas:

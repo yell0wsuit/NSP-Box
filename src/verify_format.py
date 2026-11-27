@@ -180,7 +180,7 @@ def partition(buf,offset=0):
         result[name]=view
     return result
 
-def nca_sections(buf,verify_payload=True):
+def nca_sections(buf,verify_payload=True,plans=None):
     require(len(buf)>=0xc00 and bytes(buf[0x200:0x204])==b'NCA3')
     require(u('Q',buf,0x208)[0]==len(buf))
     title=u('Q',buf,0x210)[0];sections=[]
@@ -199,9 +199,12 @@ def nca_sections(buf,verify_payload=True):
             require(0<block<=16*1024*1024 and len(hashes)==hs and len(data)==ds,'PFS section bounds')
             if verify_payload:
                 require(digest(hashes)==bytes(header[8:40]),'PFS master hash')
-                with closing(block_digests(data,block)) as generated:
-                    for k,actual in enumerate(generated):
-                        require(actual==bytes(hashes[k*32:k*32+32]),'PFS block hash')
+                require(((ds+block-1)//block)*32<=len(hashes),'PFS hash table too short')
+                if plans is not None:plans.append((data,block,False,hashes,'PFS block hash'))
+                else:
+                    with closing(block_digests(data,block)) as generated:
+                        for k,actual in enumerate(generated):
+                            require(actual==bytes(hashes[k*32:k*32+32]),'PFS block hash')
             sections.append(('pfs',data))
         elif header[3]==3:
             require(bytes(header[8:12])==b'IVFC')
@@ -213,13 +216,73 @@ def nca_sections(buf,verify_payload=True):
                 block=1<<order
                 data=body[off:off+size];require(len(data)==size)
                 if verify_payload:
-                    with closing(block_digests(data,block,padded=True)) as generated:
-                        for k,actual in enumerate(generated):
-                            require(actual==bytes(expected[k*32:k*32+32]),('IVFC',j,k))
+                    require(((size+block-1)//block)*32<=len(expected),'IVFC hash table too short')
+                    if plans is not None:plans.append((data,block,True,expected,('IVFC',j)))
+                    else:
+                        with closing(block_digests(data,block,padded=True)) as generated:
+                            for k,actual in enumerate(generated):
+                                require(actual==bytes(expected[k*32:k*32+32]),('IVFC',j,k))
                 expected=data
             sections.append(('romfs',data))
         else:raise ValueError('Unsupported hash')
     return title,buf[0x205],sections
+
+def verified_nca(buf,workers=None):
+    """Hash the NCA in physical order while checking adjacent integrity blocks.
+
+    Every byte still contributes to the full SHA-256, including gaps and padding.
+    Block hashes remain independent; only their memory traversal is interleaved.
+    """
+    workers=min(4,os.cpu_count() or 1) if workers is None else max(1,min(16,workers))
+    if not isinstance(buf,Region) or len(buf)<8*1024*1024:
+        return digest(buf),nca_sections(buf)
+    plans=[]
+    parsed=nca_sections(buf,plans=plans)
+    plans.sort(key=lambda plan:plan[0].offset)
+    cursor=buf.offset
+    for data,block,padded,expected,label in plans:
+        if not len(data):continue
+        if data.offset<cursor or data.offset+len(data)>buf.offset+len(buf):
+            # Preserve the original verifier's semantics for unusual overlapping layouts.
+            return digest(buf),nca_sections(buf)
+        cursor=data.offset+len(data)
+    h=hashlib.sha256()
+    from collections import deque
+    def validate(data,block,padded,expected,label,start,end):
+        with memoryview(data.mapping) as mapped:
+            for off in range(start,end,block):
+                count=min(block,len(data)-off)
+                with mapped[data.offset+off:data.offset+off+count] as chunk:
+                    bh=hashlib.sha256(chunk)
+                if padded and count<block:bh.update(bytes(block-count))
+                k=off//block
+                require(bh.digest()==bytes(expected[k*32:k*32+32]),label)
+    cursor=buf.offset
+    with memoryview(buf.mapping) as mapped,ThreadPoolExecutor(max_workers=workers) as pool:
+        pending=deque()
+        def consume():
+            checkpoint();pending.popleft().result()
+        def hash_range(start,end):
+            for off in range(start,end,4*1024*1024):
+                checkpoint()
+                with mapped[off:min(end,off+4*1024*1024)] as chunk:h.update(chunk)
+        for data,block,padded,expected,label in plans:
+            if not len(data):continue
+            hash_range(cursor,data.offset)
+            batch=max(1,(4*1024*1024)//block)*block
+            for off in range(0,len(data),batch):
+                checkpoint()
+                end=min(off+batch,len(data))
+                if workers==1 or end-off<64*1024:
+                    validate(data,block,padded,expected,label,off,end)
+                else:
+                    pending.append(pool.submit(validate,data,block,padded,expected,label,off,end))
+                hash_range(data.offset+off,data.offset+end)
+                if len(pending)>=workers*2:consume()
+            cursor=data.offset+len(data)
+        hash_range(cursor,buf.offset+len(buf))
+        while pending:consume()
+    return h.digest(),parsed
 
 def romfs_files(buf,validate_name=None):
     """Bounded RomFS traversal: never follow repeated offsets in imported NSPs."""

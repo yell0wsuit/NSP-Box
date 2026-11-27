@@ -134,9 +134,8 @@ def _verify_region(buf,snapshot,inventory,notify,source_hashes=None):
     for name,data in ncas.items():
         fmt.checkpoint()
         verifier.require(data[0x204]==distribution,'NCA distribution type')
-        nca_hashes[name]=verifier.digest(data)
+        nca_hashes[name],parsed[name]=verifier.verified_nca(data)
         verifier.require(nca_hashes[name][:16].hex()==name[:32],'NCA content hash')
-        parsed[name]=verifier.nca_sections(data)
     program=next(v for v in parsed.values() if v[1]==0)
     verifier.require(program[0]==snapshot.title_id,'Program ID mismatch')
     exefs=verifier.partition(next(b for kind,b in program[2] if kind=='pfs'))
