@@ -50,7 +50,7 @@ jobs:
       - name: Build portable executable
         run: python -m PyInstaller --noconfirm --clean Packager.spec
       - name: Check frozen NSP builds
-        run: python frozen_smoke.py
+        run: python frozen_smoke.py --workers 2
       - name: Check frozen NUP tools
         run: python frozen_nup_smoke.py
       - name: Assemble allowlisted release

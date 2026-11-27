@@ -1,9 +1,10 @@
 """Exercise every NUP operation using the frozen app and synthetic game data."""
 from pathlib import Path
-import argparse,json,subprocess,tempfile,struct,sys
+import argparse,json,subprocess,tempfile,struct,sys,time
 
 def main():
     parser=argparse.ArgumentParser();parser.add_argument('--executable',type=Path,default=Path('dist/NSP-Box.exe'));args=parser.parse_args()
+    started=time.perf_counter()
     executable=args.executable.resolve();scratch=Path(__file__).parent/'test-work';scratch.mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='frozen-nup-',dir=scratch) as tmp:
         root=Path(tmp);game=root/'Game';(game/'exefs').mkdir(parents=True);(game/'romfs').mkdir()
@@ -12,15 +13,17 @@ def main():
         def run(operation,source,output=None):
             report=root/(operation+'.json');cmd=[str(executable),'--nup-operation',operation,'--input',str(source),'--result-json',str(report)]
             if output:cmd+=['--output',str(output)]
+            tick=time.perf_counter()
             result=subprocess.run(cmd,capture_output=True,timeout=90)
             assert report.is_file(),(operation,result.returncode,result.stderr)
             info=json.loads(report.read_text(encoding='utf-8'));assert result.returncode==0,(operation,info)
-            print(json.dumps({'frozen_nup':operation,'passed':True}));return info
+            print(json.dumps({'frozen_nup':operation,'passed':True,'seconds':round(time.perf_counter()-tick,3)}),flush=True);return info
         nup=root/'Game.nup';run('pack',game,nup);run('inspect',nup);run('verify',nup)
         extracted=root/'extracted';run('extract',nup,extracted)
         assert (extracted/'base/exefs/main.npdm').read_bytes()==bytes(npdm)
         nsp=root/'Game.nsp';run('nup-to-nsp',nup,nsp)
         run('nsp-to-nup',nsp,root/'Repacked.nup')
+    print(json.dumps({'frozen_nup_total_seconds':round(time.perf_counter()-started,3)}),flush=True)
     return 0
 
 if __name__=='__main__':sys.exit(main())
