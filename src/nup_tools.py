@@ -394,8 +394,12 @@ def build_snapshot_nsp(package,output,verify=True,notify=lambda *a:None,cancel=N
         temp=output.with_name(output.name+'.'+uuid.uuid4().hex[:10]+'.partial')
         try:
             with temp.open('xb') as out:
-                done=0
-                for b in blob.chunks():check(cancel);out.write(b);done+=len(b);notify('Writing reconstructed NSP',60+25*done/blob.size)
+                done=0;last=0.0
+                for b in blob.chunks(4*1024*1024):
+                    check(cancel);out.write(b);done+=len(b)
+                    now=time.monotonic()
+                    if now-last>=0.1:notify('Writing reconstructed NSP',60+25*done/blob.size);last=now
+                notify('Writing reconstructed NSP',85)
                 out.flush();os.fsync(out.fileno())
             if verify:
                 with nsp_packages(temp,cancel) as rebuilt:

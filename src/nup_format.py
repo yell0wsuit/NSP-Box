@@ -134,10 +134,16 @@ def dedup_stream(source,prefixes,seen,cancel,on_read):
         if extent is not None:yield None,None,digest,extent;return
     with source.opener() as stream:yield stream,b'',digest,None
 
-def write_extent(out,source,stream,first,level,large_raw,cancel,on_read,known_digest=None):
+def write_extent(out,source,stream,first,level,large_raw,cancel,on_read,known_digest=None,workers=1):
     start=out.tell();codec=not (large_raw and source.size>LARGE_FILE) and source.size>0
     h=hashlib.sha256();count=0;failed=False
-    try:compressor=zstd.ZstdCompressor(level=level,write_content_size=True).compressobj(size=source.size) if codec else None
+    # Native Zstandard workers retain a single interoperable frame.
+    # Limit concurrency for high levels and avoid thread overhead on small files.
+    threads=min(2 if level==9 else 4,workers) if workers>1 and source.size>=32*BLOCK else 0
+    try:
+        options={'level':level,'write_content_size':True}
+        if threads:options['threads']=threads
+        compressor=zstd.ZstdCompressor(**options).compressobj(size=source.size) if codec else None
     except zstd.ZstdError:compressor=None;codec=False
     b=first or stream.read(BLOCK)
     while b:
@@ -209,12 +215,17 @@ def pack(packages,output,level=3,large_raw=True,verify=True,notify=lambda *a:Non
             workers=min(4,os.cpu_count() or 1) if workers is None else max(1,min(8,workers))
             # Bounded small-file batches: read once, deduplicate before compression,
             # compress independent unique payloads, commit in original table order.
+            compression_local=threading.local()
             def compress_small(data):
                 check(cancel)
                 if not data:return data,0
                 try:
-                    encoded=zstd.ZstdCompressor(level=level,write_content_size=True).compress(data)
-                except zstd.ZstdError:return data,0
+                    if not hasattr(compression_local,'compressor'):
+                        compression_local.compressor=zstd.ZstdCompressor(level=level,write_content_size=True)
+                    encoded=compression_local.compressor.compress(data)
+                except zstd.ZstdError:
+                    compression_local.__dict__.pop('compressor',None)
+                    return data,0
                 return (encoded,1) if len(encoded)<len(data) else (data,0)
             def small_batch(batch,pool):
                 nonlocal done,duplicate_files
@@ -248,7 +259,7 @@ def pack(packages,output,level=3,large_raw=True,verify=True,notify=lambda *a:Non
                         off,size,enc=extent;node[2:]=[off,size,known,enc];duplicate_files+=1
                     else:
                         start=align(out.tell());out.write(bytes(start-out.tell()))
-                        stored,digest,codec=write_extent(out,source,stream,first,level,large_raw,cancel,on_read,known)
+                        stored,digest,codec=write_extent(out,source,stream,first,level,large_raw,cancel,on_read,known,workers)
                         if source.size==0:node[2:]=[0,0,digest,0]
                         else:node[2:]=[start,stored,digest,codec];seen[(digest,source.size)]=(start,stored,codec)
                 done+=source.size
@@ -421,17 +432,18 @@ class Archive:
         self.stats={'packages':pc,'files':nf,'uncompressed':sum(f[1] for f in self.files),'stored':sum(k[1]-k[0] for k in extent_ids),'archive_size':fs,
                     'compressed_files':sum(f[5]==1 for f in self.files),'raw_files':sum(f[5]==0 for f in self.files),'unique_extents':len(extent_ids)}
     @contextmanager
-    def open_file(self,index):
+    def open_file(self,index,handle=None,decoder=None):
         _,size,off,stored,digest,codec=self.files[index]
-        raw=Slice(self.path,off,stored)
+        raw=Slice(self.path,off,stored,handle=handle)
         try:
             if codec:
-                with zstd.ZstdDecompressor(max_window_size=MAX_ZSTD_WINDOW).stream_reader(raw,read_across_frames=False,closefd=False) as reader:yield reader
+                if decoder is None:decoder=zstd.ZstdDecompressor(max_window_size=MAX_ZSTD_WINDOW)
+                with decoder.stream_reader(raw,read_across_frames=False,closefd=False) as reader:yield reader
             else:yield raw
         finally:raw.close()
-    def file_chunks(self,index):
+    def file_chunks(self,index,handle=None,decoder=None):
         _,size,off,stored,digest,codec=self.files[index];h=hashlib.sha256();count=0
-        with self.open_file(index) as source:
+        with self.open_file(index,handle,decoder) as source:
             while b:=source.read(min(BLOCK,size-count+1)):
                 check(self.cancel);count+=len(b);require(count<=size,'Decompressed file exceeds its declared size.');h.update(b);yield b
         require(count==size and h.digest()==digest,'File SHA-256 mismatch: '+self.files[index][0])
@@ -568,20 +580,34 @@ def extract(path,output,selection=None,notify=lambda *a:None,cancel=None,workers
                 for directory in sorted(p.directories):check(cancel);(base/directory).mkdir(parents=True,exist_ok=True)
                 count=min(4,os.cpu_count() or 1) if workers is None else max(1,min(8,workers))
                 if archive.max_frame_window:count=min(count,max(1,(256*BLOCK)//archive.max_frame_window))
-                def extract_one(entry):
-                    item,index=entry;check(cancel)
-                    target=base/item;target.parent.mkdir(parents=True,exist_ok=True)
-                    with target.open('xb') as f:
-                        for chunk in archive.file_chunks(index):f.write(chunk)
-                    return archive.files[index][1]
-                entries=iter(archive.trees[k].items())
-                with ThreadPoolExecutor(max_workers=count) as pool:
+                local=threading.local()
+                def extract_group(entries):
+                    # One decoder and one archive handle per group, not per file.
+                    if not hasattr(local,'decoder'):
+                        local.decoder=zstd.ZstdDecompressor(max_window_size=MAX_ZSTD_WINDOW)
+                    size=0
+                    with archive.path.open('rb') as handle:
+                        for item,index in entries:
+                            check(cancel)
+                            target=base/item;target.parent.mkdir(parents=True,exist_ok=True)
+                            with target.open('xb') as f:
+                                for chunk in archive.file_chunks(index,handle,local.decoder):f.write(chunk)
+                            size+=archive.files[index][1]
+                    return size
+                # Group nearby extents for locality, with bounded pending work.
+                entries=iter(sorted(archive.trees[k].items(),key=lambda item:archive.files[item[1]][2]))
+                with ThreadPoolExecutor(max_workers=count) as executor:
                     while True:
                         check(cancel);batch=[]
                         for _ in range(count*2):
-                            entry=next(entries,None)
-                            if entry is None:break
-                            batch.append(pool.submit(extract_one,entry))
+                            group=[];size=0
+                            for _ in range(32):
+                                entry=next(entries,None)
+                                if entry is None:break
+                                group.append(entry);size+=archive.files[entry[1]][1]
+                                if size>=8*BLOCK:break
+                            if not group:break
+                            batch.append(executor.submit(extract_group,group))
                         if not batch:break
                         for future in batch:
                             done+=future.result()
